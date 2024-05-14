@@ -162,15 +162,13 @@ custom_snapclust_assignment_dot_plot <- function(
       aes(
         x = TrueGroup,
         y = AssignedGroup,
-        size = Fraction,
-        fill = Fraction
+        size = Fraction
       )
     ) +
     xlab(actual_group_title) +
     ylab(assigned_group_title) +
     scale_x_discrete(position = "top") +
-    scale_fill_distiller(palette = "Greys") +
-    geom_point(pch = 21, show.legend = FALSE) +
+    geom_point(show.legend = FALSE) +
     geom_text(
       aes(label = paste(round(Fraction, 3) * 100, "%"), size = 0.25),
       show.legend = FALSE,
