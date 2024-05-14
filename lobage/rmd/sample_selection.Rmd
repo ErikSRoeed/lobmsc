@@ -34,7 +34,7 @@ library(ggsignif)
 
 ## Data availability statement
 The datasets at `OBSERVATION_DATA_PATH` and `SAMPLES_DATA_PATH` are unpublished
-(as of writing), but available upon reasonable request to Louise Chavarie
+(as of writing), but can be requested from Louise Chavarie
 (louise.chavarie@nmbu.no).
 
 The `final_sample_selection.csv` file this document outputs is bundled in the 

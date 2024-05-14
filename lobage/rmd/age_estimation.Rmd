@@ -14,9 +14,9 @@ output:
 ---
 # Code: Age estimation
 ## Data availability statement
-The data required to knit this rmd file are included in the repository, except that a) the data at `METHYLATION_PATH` is available upon reasonable request to
+The data required to knit this rmd file are included in the repository, except that a) the data at `METHYLATION_PATH` may be requested from
 Marie Saitou (marie.saitou@nmbu.no) or Louise Chavarie (louise.chavarie@nmbu.no), and b) the data at `FAIRFIELD_DATA_PATH` should
-be archived by or available from:
+be archived by or available from the authors of:
 
 Fairfield, E.A. et al. (2021) “Ageing European lobsters (Homarus gammarus) using DNA methylation of evolutionarily conserved ribosomal DNA,” Evolutionary Applications, 14(9), 2305–2318. Available at: https://doi.org/10.1111/eva.13296.
 
