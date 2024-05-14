@@ -1,0 +1,97 @@
+initialize() { // NB! SLiMGUI
+	// Set WORKING_DIR as per your lobsim repository directory (crashes otherwise)
+	// defineConstant("WORKING_DIR", "");
+
+	// Should be universal for any location of lobsim (defaults included)
+	defineConstant("NU", 79);
+	defineConstant("MU", 0.0);
+	defineConstant("RHO", 0.5);
+	defineConstant("N", 10000);
+	defineConstant("N2", 1000);
+	defineConstant("M", 0.001);
+	defineConstant("OUTPUT_DIR", "output/test");
+	defineConstant("REFERENCE_SNPS", randomNucleotides(length = NU));
+	defineConstant("INPUT_N", 159);
+	defineConstant("INPUT2_N", 20);
+	defineConstant("INPUT_VCF", "output/exeter_vcf/Scandinavia.vcf");
+	defineConstant("INPUT2_VCF", "output/exeter_vcf/Americanus.vcf");
+	defineConstant("OUTPUT_VCF_SUFFIX", "_GammarusIntrogressed");
+	defineConstant("OUTPUT2_VCF_SUFFIX", "_Hybrids_F1");
+}
+
+initialize() { // Main initialize
+	setwd(path = WORKING_DIR);
+	
+	initializeSLiMOptions(nucleotideBased = T);
+	initializeAncestralNucleotides(REFERENCE_SNPS);
+	initializeMutationTypeNuc("m1", 0.5, "f", 0.0);
+	initializeGenomicElementType("g1", m1, 1, mmJukesCantor(MU));
+	initializeGenomicElement(g1, 0, NU - 1);
+	initializeRecombinationRate(RHO);
+	
+	m1.convertToSubstitution = F;
+}
+
+function (string) writeOutputPath (string$ dir, string$ suffix, string$ extension) {
+	outputPath = paste0(dir, "/", getSeed() * community.tick, suffix, extension);
+	return(outputPath);
+}
+
+function (void) outputHybrids (float$ introgressionFraction, string$ outputSuffix) {
+	allIndividuals = community.allSubpopulations.individuals;
+	outputHybridIndices = which(allIndividuals.tagF == introgressionFraction);
+	outputHybrids = allIndividuals[outputHybridIndices];
+	
+	if (length(outputHybrids) > 0) {
+		outputFilePath = writeOutputPath(OUTPUT_DIR, outputSuffix, ".vcf");
+		outputHybrids.genomes.outputVCF(outputFilePath, T, F, T, F);
+	}
+
+	return;
+}
+
+modifyChild() { // Track parentage
+	child.tagF = mean(x = c(parent1.tagF, parent2.tagF));
+	return(T);
+}
+
+modifyChild() { // NB! SLiMGUI
+	child.color = rgb2color(rgb = c(child.tagF, 0, 1 - child.tagF));
+	return(T);
+}
+
+1 early() { // Gammarus pop
+	sim.addSubpop(subpopID = "p1", size = INPUT_N);
+	p1.individuals.genomes.readFromVCF(filePath = INPUT_VCF, mutationType = m1);
+	p1.individuals.tagF = 0.0;
+	p1.setSubpopulationSize(size = N);
+}
+
+1 early() { // Americanus pop
+	sim.addSubpop(subpopID = "p2", size = INPUT2_N);
+	p2.individuals.genomes.readFromVCF(filePath = INPUT2_VCF, mutationType = m1);
+	p2.individuals.tagF = 1.0;
+	p2.setSubpopulationSize(size = N2);
+}
+
+1 early() { // NB! SLiMGUI
+	p1.individuals.color = rgb2color(rgb = c(0.0, 0.0, 1.0)); // gammarus is blue
+	p2.individuals.color = rgb2color(rgb = c(1.0, 0.0, 0.0)); // americanus is red
+}
+
+100 early() { // Invasions
+	p1.setMigrationRates(sourceSubpops = p2, rates = M);
+}
+
+101:125 late() { // Output F1, F2, etc ...
+	outputHybrids(introgressionFraction = 0.50, outputSuffix = OUTPUT2_VCF_SUFFIX);
+}
+
+125 late() { // Output p1
+	outputFilePath = writeOutputPath(OUTPUT_DIR, OUTPUT_VCF_SUFFIX, ".vcf");
+	p1.individuals.genomes.outputVCF(outputFilePath, T, F, T, F);
+}
+
+125 late() { // Finish
+	sim.simulationFinished();
+}
