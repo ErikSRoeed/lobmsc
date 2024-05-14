@@ -1,0 +1,3237 @@
+---
+title: "Like clockwork? A longitudinal test of an epigenetic clock in wild European losters (Homarus gammarus)"
+author: "Erik Sandertun Røed"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    toc_title_float: true
+    code_folding: "hide"
+    highlight: "breezedark"
+    theme: "spacelab"
+---
+# Code: Age estimation
+## Data availability statement
+The data required to knit this rmd file are included in the repository, except that a) the data at `METHYLATION_PATH` is available upon reasonable request to
+Marie Saitou (marie.saitou@nmbu.no) or Louise Chavarie (louise.chavarie@nmbu.no), and b) the data at `FAIRFIELD_DATA_PATH` should
+be archived by or available from:
+
+Fairfield, E.A. et al. (2021) “Ageing European lobsters (Homarus gammarus) using DNA methylation of evolutionarily conserved ribosomal DNA,” Evolutionary Applications, 14(9), 2305–2318. Available at: https://doi.org/10.1111/eva.13296.
+
+## Step 0: Setup
+### Random seed
+I set the random seed to a set value so that models are trained consistently:
+```{r set_seed, class.source = 'fold-show'}
+#         N M B U
+set.seed(14130220)
+```
+
+### Dependencies
+I use the following CRAN packages in this document:
+```{r setup, message = FALSE, warning = FALSE, class.source = 'fold-show'}
+# For RMarkdown report
+library(knitr)
+library(kableExtra)
+
+# For data wrangling
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(magrittr)
+library(stringr)
+
+# For visualisation
+library(ggplot2)
+library(ggh4x)
+library(patchwork)
+library(ggsignif)
+library(ggnewscale)
+library(ggvenn)
+
+# For colours
+library(viridis) # Used via ggplot viridis functions
+library(RColorBrewer)
+
+# For (more or less formal) analyses and model training
+library(lmerTest)
+library(MuMIn)
+library(caret)
+library(rsample)
+```
+
+### Universal plotting definitions
+#### Colours
+```{r universal_plotting_definitions, class.source = 'fold-show'}
+CAP_COLOUR <- RColorBrewer::brewer.pal(n = 6, "Dark2")[5]
+RECAP_COLOUR <- RColorBrewer::brewer.pal(n = 6, "Dark2")[6]
+FEMALE_COLOUR <- RColorBrewer::brewer.pal(n = 3, "Set2")[2]
+MALE_COLOUR <- RColorBrewer::brewer.pal(n = 3, "Set2")[3]
+MODEL_COLOURS <- RColorBrewer::brewer.pal(4, "Set1")
+MODEL_TEST_TRAIN_COLOURS <- RColorBrewer::brewer.pal(4, "Paired")
+```
+
+#### Universal plot themes
+```{r heatmaps_ggtheme, class.source = 'fold-show'}
+ggtheme_scatter <- ggplot2::theme(
+  panel.border = ggplot2::element_rect(colour = "black", fill = NA),
+  panel.grid = ggplot2::element_blank()
+)
+
+ggtheme_heatmap <- ggplot2::theme(
+  axis.text.x = ggplot2::element_text(hjust = 0, size = 7),
+  axis.ticks = ggplot2::element_blank(),
+  axis.title.y = ggplot2::element_text(vjust = 3),
+  legend.background = ggplot2::element_rect(
+    colour = "black",
+    fill = "#ebebeb",
+    linewidth = 0.25
+  ),
+  legend.justification = c(0, 1),
+  panel.border = ggplot2::element_rect(
+    colour = "black",
+    fill = NA
+  ),
+  panel.grid = ggplot2::element_blank()
+)
+```
+
+#### Locus labels
+We have sequencing data for 442 loci across the 18S, ITS1 - ITS2, and 28S
+regions. I define below the index of the first locus in each region so we can
+label their position. With this I produce a vector of labels for all 442 loci.
+```{r sequencing_data_definitions, class.source = 'fold-show'}
+PLOT_LOCUS_LABELS <- rep(x = "", length.out = 442) %>% 
+  replace(
+    list   = c(1,     116,    137,    186),
+    values = c("18S", "ITS1", "ITS2", "28S")
+  )
+```
+
+## Step 1: Data import and wrangling
+### Dataset definitions
+First, define the (relative) dataset paths within the R project:
+```{r define_dataset_paths, class.source = 'fold-show'}
+LOBSTER_PATH <- "../data/20240330_lobage_lobsters_48ind_96dna.xlsx"
+METHYLATION_PATH <- "../data/20240313_lobage_methylation_48ind_96dna.xlsx"
+```
+
+### Reading in Fairfield data
+Read in the coefficients from the Fairfield _et al._ (2021) paper (the
+corresponding author kindly confirmed these values).
+```{r read_in_fairfield_coefficients, class.source = 'fold-show'}
+FAIRFIELD_ELASTICNET_CpG <- readRDS("../data/FAIRFIELD_ELASTICNET_CpG.rds")
+```
+
+Also define the relative path to their original methylation dataset (for later):
+```{r path_to_fairfield_data, class.source = 'fold-show'}
+FAIRFIELD_DATA_PATH <- "../data/FAIRFIELD_lobster_data_for_dryad.xls"
+```
+
+### Load and wrangle lobster data
+#### Lobster data
+I load the lobster dataset in its original wider format, where one row
+corresponds to one lobster. Make the necessary "type declarations":
+```{r load_lobsters_samples, class.source = 'fold-show'}
+lobsters <- LOBSTER_PATH %>%
+  readxl::read_xlsx(sheet = "LobsterData", na = "NA") %>%
+  dplyr::mutate(LobsterID = factor(LobsterID, levels = LobsterID)) %>% 
+  dplyr::mutate(Sex = factor(Sex, levels = c("F", "M"))) %>% 
+  dplyr::mutate(ZoneID = factor(ZoneID, levels = c("M", "S", "NE"))) %>% 
+  dplyr::mutate(
+    CaptureIntervalBins = factor(
+      CaptureIntervalBins, levels = rev(unique(CaptureIntervalBins))
+    )
+  )
+```
+
+I also add new columns for the capture interval in months, the mean length
+of capture and recapture, the "seasonality", i.e. "Dec-Dec", "Sep-Sep",
+"Sep-Dec", or "Dec-Sep" (coded as "1212", "99", "912", and "129"), and "egg
+class" i.e. whether a female went from having eggs to not having them, vice
+versa, had both times, or neither (+-, -+, ++, --):
+```{r add_cap_recap_seasonality, class.source = 'fold-show'}
+DAYS_IN_MONTH <- 30.5
+
+lobsters %<>% 
+  dplyr::mutate(
+    CaptureIntervalMonths = round(
+      CaptureIntervalDays / DAYS_IN_MONTH,
+      digits = 1
+    ),
+    .after = CaptureIntervalBins
+  ) %>%
+  dplyr::mutate(
+    MeanLengthCM = (CaptureLengthCM + RecaptureLengthCM) / 2,
+    .after = RecaptureLengthCM
+  ) %>% 
+  dplyr::mutate(
+    Seasonality = factor(
+      paste0(
+        lubridate::month(CaptureDate),
+        lubridate::month(RecaptureDate)
+      ),
+      levels = c("99", "912", "1212", "129")
+    ),
+    .after = RecaptureDate
+  ) %>% 
+  mutate(
+    EggsClass = factor(
+      ifelse(
+        Sex == "M", NA,
+        paste0(
+          ifelse(CaptureEggs, "+", "-"),
+          ifelse(RecaptureEggs, "+", "-")
+        )
+      ),
+      levels = c("--", "-+", "+-", "++")
+    ),
+    .after = RecaptureEggs,
+  )
+```
+
+```{r show_lobster_table, echo=FALSE}
+lobsters %>%
+  head(n = 10) %>%
+  kableExtra::kbl(
+    align = "c", 
+    caption = "TABLE 1: N = 10 first lobsters."
+  ) %>% 
+  kableExtra::kable_paper(fixed_thead = TRUE) %>% 
+  kableExtra::kable_styling(font_size = 10) %>% 
+  kableExtra::scroll_box(width = "100%")
+```
+
+#### Sample data
+For some of my purposes, it is easier to consider the data in a longer format,
+where each row corresponds to one _sample_ rather than one _lobster_. Pivot
+like so:
+```{r wrangle_samples, class.source = 'fold-show'}
+lobster_samples <- lobsters %>%  
+  dplyr::select(-GrowthCM, -MeanLengthCM, -Seasonality, -EggsClass) %>%
+  dplyr::mutate(MonthsPassed = CaptureIntervalMonths, .after = Sex) %>% 
+  dplyr::select(-contains("Interval")) %>%
+  tidyr::pivot_longer(
+    cols = contains("apture"),
+    names_pattern = "(.*apture)(.*)$",
+    names_to = c("Encounter", "Measurement"),
+    # All values must be same type, I convert them back below
+    values_transform = as.character,
+    names_transform = as.factor
+  ) %>%
+  tidyr::pivot_wider(
+    # Pivot each measurement out to a column
+    names_from = "Measurement",
+    values_from = "value"
+  ) %>% 
+  dplyr::mutate(
+    MonthsPassed = ifelse(Encounter == "Capture", 0, MonthsPassed)
+  ) %>% 
+  dplyr::mutate(LengthCM = as.numeric(LengthCM)) %>% 
+  dplyr::mutate(Date = as.Date.character(Date)) %>% 
+  dplyr::mutate(SampleNumber = as.numeric(SampleNumber)) %>% 
+  dplyr::mutate(Eggs = as.logical(Eggs))
+```
+
+I also add columns where I separate out the year and month the sample was taken,
+so I can use these in a nested random effect in linear mixed models:
+```{r add_month_to_samples, class.source = 'fold-show'}
+lobster_samples %<>% 
+  mutate(Year = lubridate::year(Date), .after = Date) %>% 
+  mutate(Month = lubridate::month(Date), .after = Year) %>% 
+  mutate(Year = as.factor(Year)) %>% 
+  mutate(Month = as.factor(Month))
+```
+
+```{r show_lobster_samples_table, echo=FALSE}
+lobster_samples %>%
+  head(n = 10) %>%
+  kableExtra::kbl(
+    align = "c", 
+    caption = "TABLE 2: N = 10 first lobster samples."
+  ) %>% 
+  kableExtra::kable_paper(fixed_thead = TRUE) %>% 
+  kableExtra::kable_styling(font_size = 10) %>% 
+  kableExtra::scroll_box(width = "100%")
+```
+
+### Load and wrangle methylation data
+#### Methylation (raw beta values)
+Next, I wrangle the methylation data so that each sample number corresponds to
+one row, with all the methylation data in the columns following the sample
+number column.
+```{r load_sample_methylation, class.source = 'fold-show'}
+COLUMN_PREFIX <- "S"
+COLUMN_SUFFIX_METHYLATION <- ".meth_ratio"
+
+sample_methylation <- METHYLATION_PATH %>%
+  readxl::read_xlsx(sheet = "meth_ratio") %>%  
+  tidyr::unite(chrom, start, col = "CpG", sep = "_") %>% 
+  dplyr::select(-end) %>% # Don't need end position of CpGs (always +1)
+  tidyr::pivot_longer(
+    cols = - CpG,
+    names_to = "SampleNumber",
+    values_to = "Methylation",
+    names_pattern = paste0(COLUMN_PREFIX, "(.*)", COLUMN_SUFFIX_METHYLATION),
+    names_transform = as.numeric
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = CpG,
+    values_from = "Methylation"
+  ) %>% 
+  # Add the prefix "CpG_" to each column name
+  dplyr::rename_with(.fn = ~ paste0("CpG_", .x), .cols = dplyr::contains("ITS"))
+```
+```{r show_methylation_table, echo=FALSE}
+sample_methylation %>%
+  head(n = 5) %>%
+  kableExtra::kbl(
+    align = "c", 
+    caption = "TABLE 3: Methylation ratios in N = 5 first lobster samples."
+  ) %>% 
+  kableExtra::kable_paper(fixed_thead = TRUE) %>% 
+  kableExtra::kable_styling(font_size = 10) %>% 
+  kableExtra::scroll_box(width = "100%")
+```
+
+#### Coverage
+I similarly load the coverage data for each locus:
+```{r load_sample_coverage, class.source = 'fold-show'}
+COLUMN_SUFFIX_COVERAGE <- ".total_count"
+
+sample_coverage <- METHYLATION_PATH %>% 
+  readxl::read_xlsx(sheet = "total_count") %>%  
+  tidyr::unite(chrom, start, col = "CpG", sep = "_") %>% 
+  dplyr::select(-end) %>% 
+  tidyr::pivot_longer(
+    cols = - CpG,
+    names_to = "SampleNumber",
+    values_to = "Methylation",
+    names_pattern = paste0(COLUMN_PREFIX, "(.*)", COLUMN_SUFFIX_COVERAGE),
+    names_transform = as.numeric
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = CpG,
+    values_from = "Methylation"
+  ) %>% 
+  dplyr::rename_with(.fn = ~ paste0("CpG_", .x), .cols = dplyr::contains("ITS"))
+```
+```{r show_coverage_table, echo = FALSE}
+sample_coverage %>%
+  head(n = 5) %>%
+  kableExtra::kbl(
+    align = "c", 
+    caption = "TABLE 4: CpG sequencing coverage in N = 5 first lobsters."
+  ) %>% 
+  kableExtra::kable_paper(fixed_thead = TRUE) %>% 
+  kableExtra::kable_styling(font_size = 10) %>% 
+  kableExtra::scroll_box(width = "100%")
+```
+
+#### Longer datasets
+Then, I pivot both to longer versions for heatmapping. Note that I ensure the
+loci are factored in ascending order so they can be easily plotted in order.
+```{r pivot_longer_sample_methylation_and_coverage, message = FALSE, class.source = 'fold-show'}
+loci_in_order <- sample_coverage %>%
+  dplyr::select(-SampleNumber) %>%
+  colnames()
+
+sample_methylation_long <- sample_methylation %>% 
+  tidyr::pivot_longer(
+    cols = -SampleNumber,
+    names_to = "Locus",
+    values_to = "Methylation"
+  ) %>% 
+  dplyr::mutate(Locus = factor(Locus, levels = loci_in_order))
+
+sample_methylation_long <- sample_coverage %>% 
+  tidyr::pivot_longer(
+    cols = -SampleNumber,
+    names_to = "Locus",
+    values_to = "Coverage"
+  ) %>% 
+  dplyr::mutate(Locus = factor(Locus, levels = loci_in_order)) %>% 
+  dplyr::left_join(sample_methylation_long, .)
+```
+
+#### Methylation to M-values
+The M value is statistically more sound than the regular beta values, but
+biologically less intuitive ... this function describes the relationship between
+the beta value and M:
+```{r convert_to_m_value, class.source = 'fold-show'}
+convert_beta_to_m <- function(beta)
+{
+  m <- log2(beta / (1 - beta))
+  return(m)
+}
+```
+Adapted from Du et al. (2010) BMC Bionformatics.
+
+I calculate the M-values for all the methylation frequencies (betas):
+```{r calculate_all_m_values, class.source = 'fold-show'}
+sample_methylation_long %<>% 
+  dplyr::mutate(M = convert_beta_to_m(Methylation), .after = Methylation)
+
+sample_methylation_mvalues <- sample_methylation_long %>% 
+  dplyr::select(-Methylation, -Coverage) %>% 
+  tidyr::pivot_wider(
+    id_cols = SampleNumber,
+    names_from = Locus,
+    values_from = M
+  )
+```
+```{r show_methylation_long_table, echo = FALSE}
+sample_methylation_long %>%
+  head(n = 10) %>%
+  kableExtra::kbl(
+    align = "c", 
+    caption = "TABLE 5: Long methylation data (first ten rows)"
+  ) %>% 
+  kableExtra::kable_paper(fixed_thead = TRUE) %>% 
+  kableExtra::kable_styling(font_size = 10) %>% 
+  kableExtra::scroll_box(width = "100%")
+```
+
+## Step 2: Explore methylation data
+### Raw methylation data
+#### Sequencing coverage
+First, we plot the sequencing coverage:
+```{r plot_sequencing_coverage, message = FALSE, fig.height = 2, fig.width = 10}
+plot_sequencing_coverage <- sample_methylation_long %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = Locus,
+      y = SampleNumber,
+      fill = log10(Coverage)
+    )
+  ) +
+  ggplot2::geom_tile() +
+  ggplot2::xlab("Methylation-called CpG loci") +
+  ggplot2::scale_x_discrete(expand = c(0, 0), labels = PLOT_LOCUS_LABELS) +
+  ggplot2::ylab("Samples") +
+  ggplot2::scale_y_discrete(expand = c(0, 0)) +
+  ggplot2::scale_fill_viridis_c(
+    option = "A",
+    limits = c(-0.25, 5.25), # Slightly extended range for tick justification
+    breaks = seq(0, 5),
+    guide = ggplot2::guide_colorbar(
+      title = expression(log["10"]*" coverage"),
+      display = "raster",
+      ticks.colour = NA,
+      frame.colour = "black",
+      frame.linewidth = 0.25,
+      title.position = "left",
+      title.theme = ggplot2::element_text(angle = 90, hjust = 0.5),
+      barheight = 6.8
+    )
+  ) +
+  ggtheme_heatmap
+```
+```{r plot_sequencing_coverage_plot, echo=FALSE, fig.height = 2, fig.width = 10}
+plot_sequencing_coverage
+```
+
+Then we extract a useful stat, the minimum coverage at any locus in any sample:
+```{r sequencing_coverage_min, class.source = 'fold-show'}
+sample_coverage %>% dplyr::select(dplyr::contains("CpG")) %>% min()
+```
+... and the mean:
+```{r sequencing_coverage_mean, class.source = 'fold-show'}
+sample_coverage %>% dplyr::select(dplyr::contains("CpG")) %>%
+  as.matrix() %>%
+  mean()
+```
+
+
+#### Methylation ratios
+I produce a heatmap of methylation betas too, which I will show below...
+```{r plot_sample_methylation, message = FALSE, fig.height = 2, fig.width = 10}
+plot_sample_methylation <- sample_methylation_long %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = Locus,
+      y = SampleNumber,
+      fill = Methylation
+    )
+  ) +
+  ggplot2::geom_tile() +
+  ggplot2::xlab("Methylation-called CpG loci") +
+  ggplot2::scale_x_discrete(
+    position = "top",
+    expand = c(0, 0),
+    labels = PLOT_LOCUS_LABELS
+  ) +
+  ggplot2::ylab("Samples") +
+  ggplot2::scale_y_discrete(expand = c(0, 0)) +
+  ggplot2::scale_fill_viridis_c(
+    option = "D",
+    limits = c(-0.05, 1.05), # Slightly extended range for tick justification
+    breaks = seq(0, 1, by = 1),
+    guide = ggplot2::guide_colorbar(
+      title = expression("Methylation ( "*beta*" )"),
+      display = "raster",
+      ticks.colour = NA,
+      frame.colour = "black",
+      frame.linewidth = 0.25,
+      title.position = "left",
+      title.theme = ggplot2::element_text(angle = 90, hjust = 0.5),
+      barheight = 13.1
+    )
+  ) +
+  ggtheme_heatmap
+```
+
+Then I similarly get some useful stats from the methylation data:
+```{r useful_methylation_stats, class.source = 'fold-show'}
+sample_methylation %>% dplyr::select(dplyr::contains("CpG")) %>% min()
+sample_methylation %>% dplyr::select(dplyr::contains("CpG")) %>% max()
+sample_methylation_mvalues %>% dplyr::select(dplyr::contains("CpG")) %>% min()
+sample_methylation_mvalues %>% dplyr::select(dplyr::contains("CpG")) %>% max()
+```
+
+#### Beta and M
+Here I show the distribution of Beta and M values (which are the two different
+representations of the methylation level):
+```{r beta_mvalue_plot, warning = FALSE, fig.height = 2, fig.width = 10}
+beta_distribution <- sample_methylation_long %>%
+  ggplot2::ggplot(aes(x = Methylation)) +
+  ggplot2::scale_y_continuous(name = "Density", expand = c(0, 0)) +
+  ggplot2::scale_x_continuous(
+    name = expression("Methylation ( "*beta*" )"),
+    limits = ggh4x::center_limits(0.5),
+    breaks = seq(0, 1, 0.2),
+    expand = c(0, 0)
+  ) +
+  ggplot2::geom_density(fill = "white") +
+  ggplot2::annotate(
+    "rect",
+    xmin = 0, xmax = 0.2, ymin = 0, ymax = 2,
+    alpha = 0.25,
+    fill = "salmon"
+  ) +
+  ggplot2::annotate(
+    "rect",
+    xmin = 0.8, xmax = 1.0, ymin = 0, ymax = 2,
+    alpha = 0.25,
+    fill = "salmon"
+  ) +
+  ggplot2::geom_vline(xintercept = 0.2, lty = 2) +
+  ggplot2::geom_vline(xintercept = 0.8, lty = 2) +
+  theme(
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.title.y = element_text(vjust = 3)
+  ) +
+  ggtheme_scatter
+
+mvalue_distribution <- sample_methylation_long %>%
+  ggplot2::ggplot(aes(x = M)) +
+  ggplot2::scale_y_continuous(name = "Density", expand = c(0, 0, 0.05, 0.05)) +
+  ggplot2::scale_x_continuous(
+    limits = center_limits(0),
+    name = expression("Methylation ( "*M*" )"),
+    expand = c(0, 0)
+  ) +
+  ggplot2::geom_density(fill = "white") +
+  theme(
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.title.y = element_blank()
+  ) +
+  ggtheme_scatter
+
+beta_distribution | mvalue_distribution
+```
+
+#### Beta and M methylation figure
+I combine the data on methylation and the conversion from beta to M in a figure:
+```{r figure_methylation_data}
+plot_methylation_data <- plot_sample_methylation +
+  (beta_distribution | mvalue_distribution) +
+  plot_layout(heights = c(2.5, 1.5), guides = "collect") +
+  plot_annotation(tag_levels = "a")
+```
+```{r plot_plot_methylation_data, fig.height = 4, fig.width = 10, echo = FALSE}
+plot_methylation_data
+```
+
+
+### Change in average methylation
+I can test if the overall (i.e. average) methylation of the different lobsters
+is associated with time and any of the covariates: length, sex, season, and eggs
+for females. Specifically, I will compare the samples, taking into account
+which lobster they came from.
+
+#### Calculating average methylation
+To do so, I first need to calculate the average methylation (beta and M) for
+each sample.
+```{r get_average_methylation, message = FALSE, class.source = 'fold-show'}
+lobster_samples %<>% 
+  dplyr::left_join(sample_methylation) %>% 
+  dplyr::mutate(
+    MeanBetaMethylation = rowMeans(
+      dplyr::select(., dplyr::contains("CpG"))
+    )
+  ) %>% 
+  dplyr::select(-contains("CpG")) %>% 
+  dplyr::left_join(sample_methylation_mvalues) %>% 
+  dplyr::mutate(
+    MeanMValueMethylation = rowMeans(
+      dplyr::select(., dplyr::contains("CpG"))
+    )
+  ) %>% 
+  dplyr::select(-contains("CpG"))
+```
+
+Some useful stats:
+```{r average_methylation_useful_stats, class.source = 'fold-show'}
+lobster_samples %>%
+  dplyr::filter(Encounter == "Capture") %>% 
+  dplyr::reframe(
+    MinMeanBeta = min(MeanBetaMethylation),
+    MaxMeanBeta = max(MeanBetaMethylation),
+    MeanMeanBeta = mean(MeanBetaMethylation),
+    SDMeanBeta = sd(MeanBetaMethylation),
+    MinMeanM = min(MeanMValueMethylation),
+    MaxMeanM = max(MeanMValueMethylation),
+    MeanMeanM = mean(MeanMValueMethylation),
+    SDMeanM = sd(MeanMValueMethylation)
+    )
+
+lobster_samples %>%
+  dplyr::filter(Encounter == "Recapture") %>% 
+  dplyr::reframe(
+    MinMeanBeta = min(MeanBetaMethylation),
+    MaxMeanBeta = max(MeanBetaMethylation),
+    MeanMeanBeta = mean(MeanBetaMethylation),
+    SDMeanBeta = sd(MeanBetaMethylation),
+    MinMeanM = min(MeanMValueMethylation),
+    MaxMeanM = max(MeanMValueMethylation),
+    MeanMeanM = mean(MeanMValueMethylation),
+    SDMeanM = sd(MeanMValueMethylation)
+    )
+```
+
+#### Statistical analysis
+Then we can use a linear mixed model with `LobsterID` as a random effect for
+the sample dataset to see if average methylation changes with time and any of
+the covariates we selected samples for (i.e. sex and length). I also ask
+whether including the nested Year/Month random effect is meaningful. Note that
+I use M values for stats because that is more statistically sound:
+```{r analyse_average_methylation_1, class.source = 'fold-show'}
+average_mvalue_lme1 <- lobster_samples %>% 
+  lmerTest::lmer(
+    data = .,
+    MeanMValueMethylation ~ MonthsPassed + LengthCM + Sex +
+      (1 | LobsterID)
+  )
+average_mvalue_lme2 <- lobster_samples %>% 
+  lmerTest::lmer(
+    data = .,
+    MeanMValueMethylation ~ MonthsPassed + LengthCM * Sex +
+      (1 | LobsterID)
+  )
+average_mvalue_lme3 <- lobster_samples %>% 
+  lmerTest::lmer(
+    data = .,
+    MeanMValueMethylation ~ MonthsPassed + LengthCM +
+      (1 | LobsterID)
+  )
+average_mvalue_lme4 <- lobster_samples %>% 
+  lmerTest::lmer(
+    data = .,
+    MeanMValueMethylation ~ MonthsPassed + Sex +
+      (1 | LobsterID)
+  )
+average_mvalue_lme5 <- lobster_samples %>% 
+  lmerTest::lmer(
+    data = .,
+    MeanMValueMethylation ~ MonthsPassed +
+      (1 | LobsterID)
+  )
+average_mvalue_lme6 <- lobster_samples %>% 
+  lmerTest::lmer(
+    data = .,
+    MeanMValueMethylation ~ MonthsPassed +
+      (1 | LobsterID) + (1 | Year/Month)
+  )
+```
+
+Comparing the models with AIC, we can see that the simplest alternative has the
+lowest AIC... As for the singular effects, we would have followed the
+guidance of Barr et al. 2013 (see `?isSingular`) if `average_mvalue_lme6` were
+best. We note that that random effect is singular and exclude it (this is the
+case also if added to the other model versions).
+```{r average_methylation_aic, class.source = 'fold-show'}
+MuMIn::AICc(
+  average_mvalue_lme1,
+  average_mvalue_lme2,
+  average_mvalue_lme3,
+  average_mvalue_lme4,
+  average_mvalue_lme5,
+  average_mvalue_lme6
+) %>% arrange(AICc)
+```
+
+I would include `Eggs`, but I need a model that actually includes both 
+males and females. So, I will stick to the best model for both sexes:
+```{r lowest_aic_average_methylation_summary}
+average_mvalue_lme5 %T>% anova() %>% summary()
+```
+
+For visualisation later, I expand a grid of predictions from this model:
+```{r mean_mvalue_plot_lme_predictions, warning = FALSE, message = FALSE}
+mean_mvalue_plot_lme_predictions <- lobster_samples %>%
+  dplyr::select(LobsterID, Sex, MonthsPassed, LengthCM)
+
+mean_mvalue_plot_lme_predictions$MeanMValueMethylation <- predict(
+  average_mvalue_lme5, mean_mvalue_plot_lme_predictions
+)
+```
+
+#### Visualisation
+I make a figure to show the differences in methylation between capture and
+recapture, taking into account the months passed since first capture where
+sensible (as that is what the best model does).
+
+For visualisation in a heatmap, I first calculate the difference in beta
+between capture and recapture. I use betas for the heatmap because the
+biological interpretation is more obvious. This also goes for the
+methylation heatmap I produced above! For analyses, I calculate the difference
+in M, too.
+```{r raw_differential_methylation, message=FALSE, class.source = 'fold-show'}
+methylation_matrix_capture <- lobster_samples %>% 
+  dplyr::left_join(sample_methylation) %>% 
+  dplyr::filter(Encounter == "Capture") %>% 
+  dplyr::select(contains("CpG")) %>%
+  as.matrix()
+
+methylation_matrix_recapture <- lobster_samples %>% 
+  dplyr::left_join(sample_methylation) %>% 
+  dplyr::filter(Encounter == "Recapture") %>% 
+  dplyr::select(contains("CpG")) %>% 
+  as.matrix()
+
+lobster_methylation_delta <- methylation_matrix_recapture %>% 
+  magrittr::subtract(methylation_matrix_capture) %>% 
+  as.data.frame() %>% 
+  cbind(LobsterID = lobsters$LobsterID, .)
+
+methylation_matrix_capture_mvalues <- lobster_samples %>% 
+  dplyr::left_join(sample_methylation_mvalues) %>% 
+  dplyr::filter(Encounter == "Capture") %>% 
+  dplyr::select(contains("CpG")) %>%
+  as.matrix()
+
+methylation_matrix_recapture_mvalues <- lobster_samples %>% 
+  dplyr::left_join(sample_methylation_mvalues) %>% 
+  dplyr::filter(Encounter == "Recapture") %>% 
+  dplyr::select(contains("CpG")) %>% 
+  as.matrix()
+
+lobster_methylation_delta_mvalues <- methylation_matrix_recapture_mvalues %>% 
+  magrittr::subtract(methylation_matrix_capture_mvalues) %>% 
+  as.data.frame() %>% 
+  cbind(LobsterID = lobsters$LobsterID, .)
+```
+
+For the thesis article, the lobsters that most increase and decrease in
+methylation:
+```{r methylation_most_decrease_increase, message = FALSE, class.source = 'fold-show'}
+methylation_most_increased_decreased <- lobster_samples %>% 
+  tidyr::pivot_wider(
+    id_cols = LobsterID,
+    names_from = Encounter,
+    values_from = c(MeanMValueMethylation, MeanBetaMethylation)
+  ) %>% 
+  dplyr::mutate(
+    DeltaM = MeanMValueMethylation_Recapture - MeanMValueMethylation_Capture
+  ) %>% 
+  dplyr::mutate(
+    DeltaBeta = MeanBetaMethylation_Recapture - MeanBetaMethylation_Capture
+  ) %>% 
+  dplyr::filter(DeltaM == max(DeltaM) | DeltaM == min(DeltaM)) %>% 
+  dplyr::select(LobsterID, dplyr::contains("Delta")) %T>% 
+  print()
+
+# How many loci increased
+methylation_most_increased_decreased %>% 
+  dplyr::left_join(lobster_methylation_delta_mvalues) %>% 
+  dplyr::select(contains("CpG")) %>% 
+  dplyr::mutate(across(contains("CpG"), ~{.x > 0})) %>% 
+  rowSums() %>% 
+  print()
+
+# How many loci decreased
+methylation_most_increased_decreased %>% 
+  dplyr::left_join(lobster_methylation_delta_mvalues) %>% 
+  dplyr::select(contains("CpG")) %>% 
+  dplyr::mutate(across(contains("CpG"), ~{.x < 0})) %>% 
+  rowSums() %>% 
+  print()
+```
+
+I want to order the lobsters by ascending length in the plots below,
+so I produce a factor of the lobsters in that order:
+```{r lobsters_by_descending_length, class.source = 'fold-show'}
+lobsters_factored_by_ascending_mean_length <- lobsters %>% 
+  dplyr::arrange(MeanLengthCM) %>% 
+  dplyr::mutate(LobsterID = factor(LobsterID, levels = LobsterID)) %>% 
+  magrittr::use_series(LobsterID)
+```
+
+I can now produce a figure. First the mean methylation as beta and M. For the
+M-value plot I show the results of the LME model, too, which was trained on
+M values.
+```{r mean_methylation_plots, fig.width = 10, fig.height = 2, class.source = 'fold-show'}
+plot_mean_methylation_betas <- lobster_samples %>% 
+  ggplot(
+    aes(
+      x = MonthsPassed,
+      fill = Encounter,
+      y = MeanBetaMethylation
+    )
+  ) +
+  geom_line(mapping = aes(group = LobsterID), alpha = 0.1) +
+  geom_point(show.legend = FALSE, pch = 21, size = 2.5) +
+  scale_fill_manual(values = c(CAP_COLOUR, RECAP_COLOUR)) +
+  scale_x_continuous(
+    name = "Months since first capture",
+    breaks = seq(from = 0, to = 36, by = 12)
+  ) +
+  scale_y_continuous(name = expression("Mean "*beta)) +
+  ggtheme_scatter
+
+plot_mean_methylation_mvalues <- lobster_samples %>% 
+  ggplot(
+    aes(
+      x = MonthsPassed,
+      y = MeanMValueMethylation
+    )
+  ) +
+  geom_line(
+    data = mean_mvalue_plot_lme_predictions,
+    mapping = aes(group = LobsterID),
+    alpha = 0.1
+  ) +
+  geom_point(
+    mapping = aes(fill = Encounter),
+    show.legend = FALSE,
+    pch = 21,
+    size = 2.5
+  ) +
+  scale_fill_manual(values = c(CAP_COLOUR, RECAP_COLOUR)) +
+  scale_x_continuous(
+    name = "Months since first capture",
+    breaks = seq(from = 0, to = 36, by = 12)
+  ) +
+  scale_y_continuous(name = "Mean M-value") +
+  ggtheme_scatter
+
+plot_mean_methylation_betas_boxplots <- lobster_samples %>% 
+  ggplot(
+    aes(
+      x = Encounter,
+      fill = Encounter,
+      y = MeanBetaMethylation
+    )
+  ) +
+  geom_boxplot() +
+  scale_fill_manual(values = c(CAP_COLOUR, RECAP_COLOUR)) +
+  theme_void()
+
+plot_mean_methylation_mvalues_boxplots <- lobster_samples %>% 
+  ggplot(
+    aes(
+      x = Encounter,
+      fill = Encounter,
+      y = MeanMValueMethylation
+    )
+  ) +
+  geom_boxplot() +
+  scale_fill_manual(values = c(CAP_COLOUR, RECAP_COLOUR)) +
+  theme_void()
+
+(plot_mean_methylation_betas | plot_mean_methylation_betas_boxplots |
+  plot_mean_methylation_mvalues | plot_mean_methylation_mvalues_boxplots) +
+  plot_layout(widths = c(4.5, 0.5, 4.5, 0.5), guides = "collect")
+```
+
+Then a heatmap of the differences in beta per locus from capture to recapture:
+```{r raw_differential_methylation_heatmap, message = FALSE}
+plot_differential_methylation_heatmap <- lobsters %>% 
+  # Sort lobsters by descending length
+  dplyr::mutate(
+    LobsterID = factor(
+      LobsterID,
+      levels = levels(lobsters_factored_by_ascending_mean_length)
+    )
+  ) %>% 
+  left_join(lobster_methylation_delta) %>% 
+  # Pivot methylation differences longer for plotting
+  tidyr::pivot_longer(
+    cols = dplyr::contains("ITS"),
+    names_to = "Locus",
+    values_to = "MethylationDifference"
+  ) %>% 
+  # Ensure loci are plotted in order
+  dplyr::mutate(Locus = factor(Locus, levels = loci_in_order)) %>% 
+  # Plot
+  ggplot2::ggplot(
+    ggplot2::aes(
+      y = Locus,
+      x = LobsterID,
+      fill = MethylationDifference
+    )
+  ) +
+  ggplot2::geom_tile() +
+  ggplot2::ylab("Methylation-called CpG loci") +
+  ggplot2::scale_y_discrete(
+    expand = c(0, 0),
+    labels = vapply( # Add an arrow to the region labels
+      PLOT_LOCUS_LABELS,
+      function(a) {
+        ifelse(a == "", "", paste(a, "\u2191"))
+      },
+      character(1)
+    ) %>% unname()
+  ) +
+  ggplot2::scale_x_discrete(expand = c(0,0), position = "top") +
+  ggplot2::xlab("Lobsters grouped by capture interval and sex (N = 48)") +
+  ggplot2::scale_fill_distiller(
+    palette = "RdBu",
+    type = "div",
+    limits = ggh4x::center_limits(),
+    breaks = seq(-0.1, 0.1, by = 0.1),
+    guide = ggplot2::guide_colorbar(
+      title = expression(Delta*" in "*beta*" at recapture"),
+      display = "raster",
+      ticks.colour = NA,
+      frame.colour = "black",
+      frame.linewidth = 0.25,
+      title.position = "left",
+      title.theme = ggplot2::element_text(angle = 90, hjust = 0.5)
+    )
+  ) +
+  ggh4x::facet_nested(
+    cols = c(
+      ggplot2::vars(CaptureIntervalBins),
+      ggplot2::vars(Sex)
+    ),
+    scales = "free_x",
+    space = "free_x",
+    labeller = ggplot2::labeller(
+      CaptureIntervalBins = c(
+        `12 mo.` = "12 months",
+        `15 mo.` = "15 months",
+        `21 mo.` = "21 months",
+        `24 mo.` = "24 months",
+        `27 mo.` = "27 mo.",
+        `36 mo.` = "*"
+      ),
+      Sex = c(
+        `F` = "\u2640",
+        `M` = "\u2642"
+      )
+    )
+  ) +
+  ggplot2::theme(
+    axis.text.x.top = ggplot2::element_blank(),
+    axis.title.x.top = ggplot2::element_text(
+      vjust = 2,
+      margin = margin(t = 10, b = 5)
+    ),
+    # So arrows in the region labels roughly begin at first CpG:
+    axis.text.y.left = element_text(vjust = -0.4),
+    panel.spacing.x = ggplot2::unit(0, "lines"),
+    strip.background = ggplot2::element_rect(
+      fill = "#ebebeb",
+      colour = "black"
+    )
+  ) +
+  ggtheme_heatmap
+```
+
+I add a number of "legend plots" that give information about the lobsters.
+These will help parse the information in the final figure, so I only show them
+there.
+```{r add_legend_plots, fig.height = 10, fig.width = 10}
+ggtheme_legendplot <- ggplot2::theme(
+    axis.title = ggplot2::element_blank(),
+    axis.ticks = ggplot2::element_blank(),
+    axis.text.x = ggplot2::element_blank(),
+    axis.text.y = ggplot2::element_text(size = 9),
+    legend.background = ggplot2::element_rect(
+      fill = "#ebebeb",
+      colour = "black",
+      linewidth = 0.25
+    ),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "black"),
+    panel.spacing.x = ggplot2::unit(0, "lines"),
+    plot.title = ggplot2::element_text(
+      size = 9,
+      hjust = 0
+    ),
+    strip.background = ggplot2::element_blank(),
+    strip.text = ggplot2::element_blank()
+  )
+
+plot_differential_methylation_season <- lobsters %>% 
+  # Sort lobsters by descending length
+  dplyr::mutate(
+    LobsterID = factor(
+      LobsterID,
+      levels = levels(lobsters_factored_by_ascending_mean_length)
+    )
+  ) %>% 
+  # Pivot capture vs. recapture longer for season
+  tidyr::pivot_longer(
+    cols = c(CaptureDate, RecaptureDate),
+    names_to = "Encounter",
+    values_to = "Season"
+  ) %>% 
+  dplyr::mutate(Month = lubridate::month(Season)) %>% 
+  dplyr::mutate(Month = ifelse(Month == "9", "Sep", "Dec")) %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      y = Encounter,
+      x = LobsterID,
+      fill = Month
+    )
+  ) + 
+  ggplot2::geom_tile() +
+  ggplot2::scale_fill_manual(
+    values = c("#1f78b4", "#a6cee3"), # From RColorBrewer "Paired" palette
+    breaks = c("Dec", "Sep"),
+    guide = ggplot2::guide_legend(
+      title = "Month",
+      position = "right",
+      direction = "vertical",
+      override.aes = ggplot2::aes(colour = "black")
+    )
+  ) +
+  ggplot2::scale_y_discrete(expand = c(0,0), labels = c("Cap.", "Rec.")) +
+  ggplot2::scale_x_discrete(expand = c(0, 0)) +
+  ggh4x::facet_nested(
+    cols = c(
+      ggplot2::vars(CaptureIntervalBins),
+      ggplot2::vars(Sex)
+    ),
+    scales = "free_x",
+    space = "free_x"
+  ) +
+  ggtheme_legendplot
+
+plot_differential_methylation_eggs <- lobsters %>% 
+  # Sort lobsters by descending length
+  dplyr::mutate(
+    LobsterID = factor(
+      LobsterID,
+      levels = levels(lobsters_factored_by_ascending_mean_length)
+    )
+  ) %>% 
+  # Pivot capture vs. recapture longer for eggs
+  tidyr::pivot_longer(
+    cols = c(CaptureEggs, RecaptureEggs),
+    names_to = "Encounter",
+    values_to = "Eggs"
+  ) %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      y = Encounter,
+      x = LobsterID,
+      fill = Eggs
+    )
+  ) + 
+  ggplot2::geom_tile() +
+  ggplot2::scale_fill_manual(
+    values = c("#ff7f00", "#fdbf6f"), # From RColorBrewer "Paired" palette
+    na.value = "#ebebeb",
+    breaks = c("TRUE", "FALSE", NA),
+    labels = c("Yes", "No", "\u2642"),
+    guide = ggplot2::guide_legend(
+      title = "Eggs",
+      position = "right",
+      direction = "vertical",
+      override.aes = ggplot2::aes(colour = "black")
+    )
+  ) +
+  ggplot2::scale_y_discrete(expand = c(0,0), labels = c("Cap.", "Rec.")) +
+  ggplot2::scale_x_discrete(expand = c(0, 0)) +
+  ggh4x::facet_nested(
+    cols = c(
+      ggplot2::vars(CaptureIntervalBins),
+      ggplot2::vars(Sex)
+    ),
+    scales = "free_x",
+    space = "free_x"
+  ) +
+  ggtheme_legendplot
+
+plot_differential_methylation_length <- lobsters %>% 
+  # Sort lobsters by descending length
+  dplyr::mutate(
+    LobsterID = factor(
+      LobsterID,
+      levels = levels(lobsters_factored_by_ascending_mean_length)
+    )
+  ) %>% 
+  # Pivot capture vs. recapture longer for length
+  tidyr::pivot_longer(
+    cols = c(CaptureLengthCM, RecaptureLengthCM),
+    names_to = "Encounter",
+    values_to = "LengthCM"
+  ) %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      y = Encounter,
+      x = LobsterID,
+      fill = LengthCM
+    )
+  ) + 
+  ggplot2::geom_tile() +
+  ggplot2::scale_fill_distiller(
+    palette = "Purples",
+    guide = ggplot2::guide_colorbar(
+      title = "Total length (cm)",
+      display = "raster",
+      direction = "vertical",
+      title.position = "left",
+      ticks.colour = NA,
+      frame.colour = "black",
+      frame.linewidth = 0.25,
+      title.theme = ggplot2::element_text(angle = 90, hjust = 0.5),
+    )
+  ) +
+  ggplot2::scale_y_discrete(expand = c(0,0), labels = c("Cap.", "Rec.")) +
+  ggplot2::scale_x_discrete(expand = c(0, 0)) +
+  ggh4x::facet_nested(
+    cols = c(
+      ggplot2::vars(CaptureIntervalBins),
+      ggplot2::vars(Sex)
+    ),
+    scales = "free_x",
+    space = "free_x"
+  ) +
+  ggtheme_legendplot
+```
+
+Then finally I patchwork this together:
+```{r methylation_diff_patchwork}
+plot_differential_methylation <- (
+  (
+    plot_mean_methylation_betas |
+      (
+        plot_mean_methylation_betas_boxplots + plot_layout(tag_level = "new")
+      ) |
+      plot_mean_methylation_mvalues |
+      (
+        plot_mean_methylation_mvalues_boxplots + plot_layout(tag_level = "new")
+      )
+  ) +
+    plot_layout(widths = c(4.5, 0.5, 4.5, 0.5), guides = "collect")
+) /
+  (
+    plot_differential_methylation_heatmap /
+      (
+        plot_differential_methylation_length /
+          plot_differential_methylation_season /
+          plot_differential_methylation_eggs +
+          plot_layout(tag_level = "new")
+      ) + 
+      plot_layout(heights = c(6.5, 2), guides = "collect")
+  ) +
+  plot_layout(heights = c(1.3, 5.2)) +
+  plot_annotation(tag_levels = "a")
+```
+```{r plot_diff_methylation, fig.height = 8.5, fig.width = 10, warning = FALSE, echo = FALSE}
+plot_differential_methylation
+```
+
+## Step 3: Test the Fairfield model
+### Age prediction function
+This takes a row from a data frame like `sample_methylation` with named columns,
+an intercept, and a set of coefficients to produce an age estimate:
+```{r define_predict_dnam_age, class.source = 'fold-show'}
+predict_dnam_age <- function(sample_cpg_values, cpg_coefficients, intercept)
+{
+  used_cpg_loci <- names(cpg_coefficients)
+  used_cpg_methylation_rates <- sample_cpg_values %>%
+    dplyr::select(all_of(used_cpg_loci)) %>%
+    as.numeric()
+  
+  age_contributions <- used_cpg_methylation_rates * cpg_coefficients
+  age_estimate <- sum(age_contributions) + intercept
+  
+  return(age_estimate)
+}
+```
+
+### Estimating Fairfield ages
+#### Age estimate per sample
+We first estimate the ages of each sample using the Fairfield model
+coefficients:
+```{r estimating_fairfield_ages, warning = FALSE, class.source = 'fold-show'}
+ageing_sample_estimates <- lobster_samples %>% 
+  dplyr::select(SampleNumber, LobsterID, Encounter)
+
+for (row in seq_len(nrow(ageing_sample_estimates)))
+{
+  sample_number <- ageing_sample_estimates$SampleNumber[row]
+  methylation_row <- which(sample_methylation$SampleNumber == sample_number)
+  
+  estimated_age <- sample_methylation[methylation_row, ] %>%
+    predict_dnam_age(
+      cpg_coefficients = FAIRFIELD_ELASTICNET_CpG,
+      intercept = 0 # Not published, so assuming zero and centre-scaling later
+    )
+  
+  ageing_sample_estimates$FairfieldAgeMonths[row] <- estimated_age
+}
+```
+
+#### Estimate centering
+For centering to an arbitrary scale because I lack the intercept.
+Don't actually need the intercept, though! I'm interested in the intervals,
+and the intercept is subtracted from that anyways. But this is for good
+measure when plotting actual "age estimates".
+```{r fairfield_estimate_centering, class.source = 'fold-show'}
+median_fairfield_capture_age <- ageing_sample_estimates %>% 
+  dplyr::filter(Encounter == "Capture") %>% 
+  magrittr::use_series(FairfieldAgeMonths) %>% 
+  median()
+
+ageing_sample_estimates$FairfieldAgeMonths %<>%
+  subtract(median_fairfield_capture_age)
+```
+
+#### Interval estimates per lobster
+For each lobster, I calculate the predicted Fairfield age interval and the ratio
+of estimate over actual interval:
+```{r calculating_fairfield_age_intervals, warning = FALSE, class.source = 'fold-show'}
+ageing_lobster_metrics <- lobsters %>% 
+  dplyr::select(
+    LobsterID,
+    CaptureIntervalMonths,
+    CaptureSampleNumber,
+    RecaptureSampleNumber
+  ) %>% 
+  dplyr::rename(KnownIntervalMonths = CaptureIntervalMonths)
+
+for (row in seq_len(nrow(ageing_lobster_metrics)))
+{
+  lobster_id <- ageing_lobster_metrics$LobsterID[row]
+  lobster_known_interval <- ageing_lobster_metrics$KnownIntervalMonths[row]
+  
+  lobster_sample_numbers <- c(
+    ageing_lobster_metrics$CaptureSampleNumber[row],
+    ageing_lobster_metrics$RecaptureSampleNumber[row]
+  )
+  
+  age_estimate_rows <- ageing_sample_estimates %>% 
+    use_series(SampleNumber) %>% 
+    is_in(lobster_sample_numbers) %>% 
+    which()
+  
+  age_estimates <- ageing_sample_estimates$FairfieldAgeMonths[age_estimate_rows]
+  interval_estimate <- age_estimates[2] - age_estimates[1]
+  
+  interval_error <- lobster_known_interval - interval_estimate
+  abs_error <- abs(interval_error)
+  relative_error <- abs_error / lobster_known_interval
+  
+  ageing_lobster_metrics$FairfieldCaptureAgeMonths[row] <- age_estimates[1]
+  ageing_lobster_metrics$FairfieldRecaptureAgeMonths[row] <- age_estimates[2]
+  ageing_lobster_metrics$FairfieldIntervalMonths[row] <- interval_estimate
+  ageing_lobster_metrics$FairfieldIntervalError[row] <- interval_error
+  ageing_lobster_metrics$FairfieldIntervalAbsError[row] <- abs_error
+  ageing_lobster_metrics$FairfieldIntervalRelativeError[row] <- relative_error
+}
+```
+
+### Evaluating the model accuracy
+I'll make a figure showing the evaluation of the model accuracy. To do that,
+I first need to make some models and calculate some stats...
+
+#### Stats for text
+These are the statistics reported in the text of the article:
+```{r text_statistics_ages_intervals, class.source = 'fold-show'}
+# Median-centred age-estimates at capture
+ageing_lobster_metrics %>%
+  magrittr::use_series(FairfieldCaptureAgeMonths) %>% 
+  unlist() %>% 
+  {
+    range(.) %>% print()
+    mean(.) %>% print()
+    sd(.) %>% print()
+  }
+
+# ... and at recapture
+ageing_lobster_metrics %>%
+  magrittr::use_series(FairfieldRecaptureAgeMonths) %>% 
+  unlist() %>% 
+  {
+    range(.) %>% print()
+    mean(.) %>% print()
+    sd(.) %>% print()
+  }
+```
+
+
+#### Stats for figure
+##### Stats for panels a - b
+First, for panel a and b, a paired t-test of capture and recapture ages:
+```{r capture_recapture_ages_stats_1, message = FALSE}
+captures <- which(ageing_sample_estimates$Encounter == "Capture")
+recaptures <- which(ageing_sample_estimates$Encounter == "Recapture")
+
+t.test(
+  x = ageing_sample_estimates$FairfieldAgeMonths[recaptures] %>% unlist(),
+  y = ageing_sample_estimates$FairfieldAgeMonths[captures] %>% unlist(),
+  alternative = "two.sided",
+  paired = TRUE
+)
+
+# This is equivalent to...
+ageing_sample_estimates %>% 
+  lmerTest::lmer(
+    FairfieldAgeMonths ~ Encounter + (1 | LobsterID),
+    data = .
+  ) %T>% anova() %>% summary()
+```
+
+Now, add covariates:
+```{r capture_recapture_ages_stats_3, message = FALSE}
+fairfield_plot_b_lme <- ageing_sample_estimates %>% 
+  dplyr::left_join(lobster_samples) %>% # Fetch data on covariates
+  lmerTest::lmer(
+    FairfieldAgeMonths ~ Encounter + LengthCM * Sex + (1 | LobsterID),
+    data = .
+  )
+
+fairfield_plot_b_lme %T>% anova() %>% summary()
+
+# Prepare a grid of predictions from the model for plotting
+fairfield_plot_b_lme_predictions <- expand.grid(
+  LobsterID = unique(lobster_samples$LobsterID),
+  Encounter = c("Capture", "Recapture"),
+  LengthCM = c(
+    min(lobster_samples$LengthCM),
+    max(lobster_samples$LengthCM)
+  )) %>%
+  left_join(dplyr::select(lobsters, LobsterID, Sex))
+
+fairfield_plot_b_lme_predictions$FairfieldAgeMonths = predict(
+  fairfield_plot_b_lme,
+  fairfield_plot_b_lme_predictions
+)
+```
+
+##### Stats for panel c
+```{r capture_recapture_ages_stats_4, message = FALSE}
+ageing_lobster_metrics %>% 
+  t.test(
+    x = .$FairfieldIntervalMonths,
+    y = .$KnownIntervalMonths,
+    data = .,
+    alternative = "two.sided",
+    paired = TRUE
+  )
+
+ageing_lobster_metrics %>% 
+  dplyr::left_join(lobsters) %>% 
+  t.test(
+    x = .$FairfieldIntervalMonths[which(lobsters$Sex == "F")],
+    y = .$FairfieldIntervalMonths[which(lobsters$Sex == "M")],
+    data. = .,
+    alternative = "two.sided"
+  )
+```
+
+##### Stats for panels d - e
+```{r capture_recapture_ages_stats_5, message = FALSE}
+fairfield_plot_de_lm <- ageing_lobster_metrics %>% 
+  dplyr::left_join(lobsters) %>% 
+  lm(
+    data = .,
+    FairfieldIntervalRelativeError ~ FairfieldCaptureAgeMonths + MeanLengthCM * Sex
+  )
+
+fairfield_plot_de_lm %T>% anova() %>% summary()
+
+# As for plot panel b, I make a grid of predictions for plotting later
+fairfield_plot_de_lm_predictions <- expand.grid(
+  FairfieldCaptureAgeMonths = c(
+    min(ageing_lobster_metrics$FairfieldCaptureAgeMonths) * 1.075,
+    max(ageing_lobster_metrics$FairfieldCaptureAgeMonths) * 1.075
+  ),
+  MeanLengthCM = c(
+    min(lobsters$MeanLengthCM) * 0.925,
+    max(lobsters$MeanLengthCM) * 1.075
+  ),
+  Sex = c("F", "M")
+)
+
+fairfield_plot_de_lm_predictions$FairfieldIntervalRelativeError <- predict(
+  fairfield_plot_de_lm, fairfield_plot_de_lm_predictions
+)
+```
+
+#### Age estimation performance figure
+Then I plot the results:
+```{r fairfield_ageing_plot, message=FALSE}
+# Figure-specific plotting definitions
+POINT_SIZE <- 2.5
+LINE_COLOUR <- "black"
+LINE_ALPHA <- 0.05
+
+# Top left
+plot_capture_recapture_ages <- ageing_sample_estimates %>% 
+  dplyr::left_join(lobster_samples) %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      y = FairfieldAgeMonths,
+      x = Encounter,
+      fill = Encounter
+    )
+  ) +
+  # Captioning
+  ggplot2::ylab("Centered age estimate (months)") +
+  # Connected points
+  ggplot2::geom_line(
+    mapping = ggplot2::aes(group = LobsterID),
+    col = LINE_COLOUR,
+    alpha = LINE_ALPHA
+  ) +
+  ggplot2::geom_point(
+    pch = 21,
+    size = POINT_SIZE, 
+    show.legend = FALSE
+  ) +
+  ggplot2::scale_fill_manual(values = c(CAP_COLOUR, RECAP_COLOUR)) +
+  # Boxplots
+  ggplot2::geom_boxplot(
+    width = 0.15,
+    fill = "white",
+    position = ggplot2::position_nudge(x = c(-0.2, 0.2)),
+    show.legend = FALSE
+  ) +
+  ggtheme_scatter
+
+# Bottom left
+plot_age_vs_size <- ageing_sample_estimates %>% 
+  dplyr::left_join(lobster_samples) %>%
+  ggplot2::ggplot(
+    ggplot2::aes(y = FairfieldAgeMonths,
+        x = LengthCM,
+        fill = Encounter,
+        colour = Encounter)
+  ) +
+  ggplot2::xlab("Total length (cm)") +
+  ggplot2::ylab("Centered age estimate (months)") +
+  ggplot2::geom_line(
+    mapping = ggplot2::aes(group = interaction(LobsterID, Encounter)),
+    data = fairfield_plot_b_lme_predictions,
+    alpha = 0.75,
+    lwd = 0.25,
+    show.legend = FALSE
+  ) +
+  ggplot2::geom_point(
+    size = POINT_SIZE,
+    pch = 21,
+    colour = "black",
+    show.legend = FALSE
+  ) +
+  ggplot2::facet_grid(
+    cols = vars(Sex),
+    labeller = labeller(
+      Sex = c(
+        `F` = "\u2640 Female",
+        `M` = "\u2642 Male"
+      )
+    )
+  ) +
+  ggplot2::scale_colour_manual(values = c(CAP_COLOUR, RECAP_COLOUR)) +
+  ggplot2::scale_fill_manual(values = c(CAP_COLOUR, RECAP_COLOUR)) +
+  ggplot2::theme(
+    strip.background = ggplot2::element_rect(
+      fill = "#ebebeb",
+      colour = "black"
+    )
+  ) +
+  ggtheme_scatter
+
+# Top right (main)
+plot_predicted_vs_known_interval <- ageing_lobster_metrics %>%
+  dplyr::left_join(lobsters) %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = KnownIntervalMonths,
+      y = FairfieldIntervalMonths,
+      fill = Sex
+    )
+  ) +
+  # Coordinate system
+  ggplot2::geom_abline(slope = 1, intercept = 0, lty = 2, lwd = 0.5) +
+  ggplot2::geom_vline(xintercept = 0, lty = 1, lwd = 0.5, alpha = 0.1) +
+  ggplot2::geom_hline(yintercept = 0, lty = 1, lwd = 0.5, alpha = 0.1) +
+  ggplot2::xlab("Known recapture age interval (months)") +
+  ggplot2::ylab("Estimated age interval (months)") +
+  ggplot2::ylim(
+    min(ageing_lobster_metrics$FairfieldIntervalMonths),
+    max(ageing_lobster_metrics$KnownIntervalMonths)
+  ) +
+  ggplot2::xlim(
+    min(ageing_lobster_metrics$FairfieldIntervalMonths),
+    max(ageing_lobster_metrics$KnownIntervalMonths)
+  ) +
+  # Segments to points
+  ggplot2::geom_segment(
+    ggplot2::aes(
+      x = 0,
+      y = 0,
+      xend = KnownIntervalMonths,
+      yend = FairfieldIntervalMonths
+    ),
+    col = LINE_COLOUR,
+    alpha = LINE_ALPHA
+  ) +
+  # Points on top
+  ggplot2::geom_point(pch = 21, size = POINT_SIZE, show.legend = FALSE) +
+  ggplot2::scale_fill_manual(values = c(FEMALE_COLOUR, MALE_COLOUR)) +
+  ggtheme_scatter
+
+# Top right (accessory)
+plot_boxplot_of_predicted_intervals <- ageing_lobster_metrics %>% 
+  dplyr::left_join(lobsters) %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      y = FairfieldIntervalMonths,
+      fill = Sex,
+      x = ""
+    )
+  ) +
+  ggplot2::ylim(
+    min(ageing_lobster_metrics$FairfieldIntervalMonths),
+    max(ageing_lobster_metrics$KnownIntervalMonths)
+  ) +
+  ggplot2::scale_x_discrete(expand = c(0, 0)) +
+  ggplot2::scale_fill_manual(
+    values = c(FEMALE_COLOUR, MALE_COLOUR),
+    labels = c("\u2640", "\u2642")
+  ) +
+  ggplot2::geom_boxplot(
+    width = 0.15,
+    position = ggplot2::position_nudge(x = c(-0.1, 0.1)),
+    key_glyph = draw_key_dotplot
+  ) +
+  ggplot2::theme(
+    axis.ticks = ggplot2::element_blank(),
+    axis.text = ggplot2::element_blank(),
+    axis.title = ggplot2::element_blank(),
+    panel.grid.major.x = ggplot2::element_blank(),
+    panel.grid = ggplot2::element_blank(),
+    panel.background = ggplot2::element_blank(),
+    legend.position = "inside",
+    legend.direction = "horizontal",
+    legend.text.position = "bottom",
+    legend.title.position = "top",
+    legend.key.spacing = ggplot2::unit(0.35, "lines"),
+    legend.title = ggplot2::element_text(hjust = 0.5, vjust = 0.15),
+    legend.justification.inside = c(
+      0.4, # x
+      0.6 # y
+    ),
+    legend.key.width = ggplot2::unit(1, "lines")
+  )
+
+plot_interval_error_contour <- ageing_lobster_metrics %>% 
+  dplyr::left_join(lobsters) %>% 
+  ggplot2::ggplot(
+    aes(
+      x = MeanLengthCM,
+      y = FairfieldCaptureAgeMonths,
+    )
+  ) +
+  ggplot2::xlab("Mean of total length at capture and recapture (cm)") +
+  ggplot2::ylab("Centered age est. (mo.) at capture") +
+  geom_contour_filled(
+    data = fairfield_plot_de_lm_predictions,
+    bins = 100,
+    mapping = aes(
+      x = MeanLengthCM,
+      y = FairfieldCaptureAgeMonths,
+      z = FairfieldIntervalRelativeError
+    ),
+    show.legend = FALSE
+  ) +
+  geom_contour(
+    data = fairfield_plot_de_lm_predictions,
+    bins = 6,
+    mapping = aes(
+      x = MeanLengthCM,
+      y = FairfieldCaptureAgeMonths,
+      z = FairfieldIntervalRelativeError
+    ),
+    colour = "black",
+    alpha = 0.25,
+    linewidth = 0.25
+  ) +
+  ggplot2::scale_fill_viridis_d(option = "E") +
+  ggnewscale::new_scale_fill() +
+  ggplot2::scale_fill_viridis_c(
+    option = "E",
+    limits = c(
+      min(fairfield_plot_de_lm_predictions$FairfieldIntervalRelativeError),
+      max(fairfield_plot_de_lm_predictions$FairfieldIntervalRelativeError)
+    ),
+    breaks = signif(
+      seq(
+        min(fairfield_plot_de_lm_predictions$FairfieldIntervalRelativeError) + 0.1,
+        max(fairfield_plot_de_lm_predictions$FairfieldIntervalRelativeError) - 0.1,
+        length.out = 5
+      ),
+      digits = 2
+    ),
+    guide = ggplot2::guide_colorbar(
+      title = "Relative error of est. interval",
+      display = "raster",
+      ticks.colour = NA,
+      frame.colour = "black",
+      frame.linewidth = 0.25,
+      barheight = 11.9,
+      title.position = "left",
+      title.theme = ggplot2::element_text(angle = 90, hjust = 0.5)
+    )
+  ) +
+  geom_point(
+    aes(fill = FairfieldIntervalRelativeError),
+    pch = 21,
+    colour = "black",
+    size = POINT_SIZE
+  ) +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  facet_grid(
+    cols = vars(Sex),
+    labeller = labeller(
+      Sex = c(
+        `F` = "\u2640 Female",
+        `M` = "\u2642 Male"
+      )
+    )
+  ) +
+  ggplot2::theme(
+    strip.background = ggplot2::element_rect(
+      fill = "#ebebeb",
+      colour = "black"
+    ),
+    legend.background = element_rect(
+      fill = "#ebebeb",
+      colour = "black",
+      linewidth = 0.25
+    ),
+    legend.box.margin = margin(-17.25,-15,0,0)
+  ) +
+  ggtheme_scatter
+
+# Patchwork together
+plot_fairfield_ageing_accuracy <- (
+  (
+    plot_capture_recapture_ages /
+      plot_age_vs_size +
+      patchwork::plot_layout(nrow = 2, heights = c(4.5, 3))
+  ) | (
+    (
+      (
+        plot_predicted_vs_known_interval |
+          patchwork::plot_spacer() |
+          (
+            # Stripped boxplot has no panel label
+            plot_boxplot_of_predicted_intervals +
+              patchwork::plot_layout(tag_level = "new")
+          ) 
+      ) + patchwork::plot_layout(ncol = 3, widths = c(0.96, -0.035, 0.075))
+    ) / (
+      plot_interval_error_contour + guide_area() + plot_layout(widths = c(10,0))
+    )
+  ) + patchwork::plot_layout(heights = c(4.5,3))
+) +
+  patchwork::plot_layout(widths = c(2, 5.5)) +
+  patchwork::plot_annotation(tag_levels = "a")
+```
+```{r plot_fairfield_ageing_accuracy, warning = FALSE, message=FALSE, fig.height=7.5, fig.width=10, echo=FALSE}
+plot_fairfield_ageing_accuracy
+```
+
+## Step 4: Filter loci with EWAS
+### rDNA EWAS
+I run an "EWAS" (Epigenome-Wide Association Scan) on the rDNA region.
+This is first and foremost to filter loci for effect size before re-training.
+First, define the significance level and type of p-value adjustment:
+```{r ewas_definitions, class.source = 'fold-show'}
+EWAS_SIGNIFICANCE_LEVEL <- 0.05
+EWAS_SIGNIFICANCE_ADJUSTMENT <- "fdr"
+```
+
+Then run the EWAS regressions themselves and find adjusted p-values.
+The EWAS regresses months passed at the different loci with lobster ID as
+a random factor (i.e. one intercept per lobster) using the M values.
+```{r ewas_analysis, warning = FALSE, message = FALSE, class.source = 'fold-show'}
+number_of_loci <- length(loci_in_order)
+
+ewas_lmer_regressions <- vector(mode = "list", length = number_of_loci)
+ewas_lmer_p_values <- vector(mode = "numeric", length = number_of_loci)
+ewas_lmer_effect_sizes <- vector(mode = "numeric", length = number_of_loci)
+ewas_lmer_r2_marginals <- vector(mode = "numeric", length = number_of_loci)
+names(ewas_lmer_regressions) <- loci_in_order
+names(ewas_lmer_p_values) <- loci_in_order
+names(ewas_lmer_effect_sizes) <- loci_in_order
+names(ewas_lmer_r2_marginals) <- loci_in_order
+
+for (locus in loci_in_order)
+{
+  ewas_locus_lmer <- lobster_samples %>% 
+    dplyr::left_join(sample_methylation_mvalues) %>% 
+    lmerTest::lmer(
+      data = ., 
+      formula = .[[locus]] ~ MonthsPassed + LengthCM * Sex +
+        (1 | LobsterID) + (1 | Year/Month) # Year/Month is mostly singular ...
+    )
+  ewas_lmer_regressions[[locus]] <- ewas_locus_lmer
+  
+  ewas_locus_p_value <- summary(ewas_locus_lmer)$coefficients[2, 5]
+  ewas_locus_effect_size <- summary(ewas_locus_lmer)$coefficients[2, 1]
+  ewas_locus_r2_marginal <- MuMIn::r.squaredGLMM(ewas_locus_lmer)[1]
+  ewas_lmer_p_values[[locus]] <- ewas_locus_p_value
+  ewas_lmer_effect_sizes[[locus]] <- ewas_locus_effect_size
+  ewas_lmer_r2_marginals[[locus]] <- ewas_locus_r2_marginal
+}
+
+ewas_lmer_p_values_adjusted <- ewas_lmer_p_values %>% 
+  stats::p.adjust(method = EWAS_SIGNIFICANCE_ADJUSTMENT)
+
+ewas_results <- data.frame(
+  `Locus` = factor(loci_in_order, levels = loci_in_order),
+  `EffectSize` = ewas_lmer_effect_sizes,
+  `MarginalR2` = ewas_lmer_r2_marginals,
+  `UnadjustedPValues` = ewas_lmer_p_values,
+  `AdjustedPValues` = ewas_lmer_p_values_adjusted
+)
+
+ewas_significant_loci <- ewas_results$AdjustedPValues %>%
+  magrittr::is_less_than(EWAS_SIGNIFICANCE_LEVEL) %>% 
+  which() %>% 
+  ewas_results$Locus[.]
+```
+
+### Manhattan plot
+The EWAS loci can be plotted in a typical Manhattan plot to show which are
+significant. This will be part of a multipanel figure later.
+```{r plot_ewas_manhattan}
+# This is unnecessarily complicated ...
+rdna_region_colours <- PLOT_LOCUS_LABELS %>%
+  # Vector of region start indices:
+  { which(. != "") } %>%
+  # Vector of region start and end indices:
+  append(length(PLOT_LOCUS_LABELS) + 1) %>% 
+  {
+    number_of_regions <- length(.) - 1
+    region_colours <- RColorBrewer::brewer.pal(number_of_regions, "Dark2")
+    point_colour_sequence <- c()
+    
+    for (region_number in seq_len(number_of_regions))
+    {
+      points_in_region <- .[region_number + 1] - .[region_number]
+      colour_reps <- rep(region_colours[region_number], points_in_region)
+      point_colour_sequence %<>% append(colour_reps)
+    }
+    point_colour_sequence # Final colours!
+  }
+
+names(rdna_region_colours) <- loci_in_order
+
+plot_ewas_manhattan <- ewas_results %>% 
+  ggplot2::ggplot(
+    data = .,
+    mapping = ggplot2::aes(
+      y = -log10(AdjustedPValues),
+      x = Locus
+    )
+  ) +
+  ggplot2::xlab("Methylation-called CpGs (N = 442)") +
+  ggplot2::ylab(expression(-log["10"]*" adjusted p-value")) +
+  ggplot2::geom_col(fill = rdna_region_colours) +
+  ggplot2::scale_y_continuous(expand = expansion(mult = c(0, 0.5))) +
+  ggplot2::scale_x_discrete(labels = PLOT_LOCUS_LABELS) +
+  ggplot2::geom_hline(yintercept = -log10(EWAS_SIGNIFICANCE_LEVEL), lty = 2) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "black"),
+    axis.title.y = ggplot2::element_text(vjust = 3.5),
+    axis.text.x = ggplot2::element_text(hjust = 0, size = 7),
+    axis.ticks.x = ggplot2::element_blank()
+  )
+```
+```{r plot_ewas_manhattan_plot, fig.width = 10, fig.height = 3, echo = FALSE}
+plot_ewas_manhattan
+```
+
+### Effect size plot
+Next to the Manhattan plot, it makes sense to show the effect sizes of the
+significant loci in context. To do this, I make a reasonably simple
+plot. It will also be part of the multipanel figure, but here it is:
+```{r ewas_effect_size_plot, echo = FALSE}
+locus_indices_to_higlight <- rdna_region_colours %>%
+  names() %>%
+  magrittr::is_in(ewas_significant_loci) %>%
+  which()
+
+rdna_region_colours_insignificant_dimmed <- rdna_region_colours
+rdna_region_colours_insignificant_dimmed[-locus_indices_to_higlight] <- NA
+
+plot_ewas_effect_sizes <- ewas_results %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = "",
+      y = EffectSize
+    )
+  ) +
+  ggplot2::geom_hline(yintercept = 0, lty = 1, alpha = LINE_ALPHA * 2) +
+  ggplot2::geom_violin() +
+  ggplot2::geom_boxplot(width = 0.15) +
+  ggplot2::geom_point(
+    ggplot2::aes(alpha = AdjustedPValues < EWAS_SIGNIFICANCE_LEVEL),
+    fill = rdna_region_colours_insignificant_dimmed,
+    show.legend = FALSE,
+    pch = 21,
+    size = 3
+  ) +
+  ggplot2::scale_alpha_manual(values = c(0, 1)) +
+  ggplot2::scale_y_continuous(name = "Effect (M) of months passed") +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_blank(),
+    axis.title.x = ggplot2::element_blank(),
+    axis.ticks.x = ggplot2::element_blank()
+  ) +
+  ggtheme_scatter
+```
+```{r fig.height = 2, fig.width = 2, warning = FALSE}
+plot_ewas_effect_sizes
+```
+
+### PCA over significant loci
+Lars (Grønvold) suggested that I could run a PCA of methylation at the
+significant loci from the EWAS.
+To do that, I wrangle the data so I retain only those loci, then run a PCA
+and collect the necessary stats from the pca object.
+I also format the PC1 and PC2 values in both long and wide format for plotting:
+```{r ewas_pca, class.source = 'fold-show', message=FALSE}
+ewas_pca_lobster_samples <- lobster_samples %>% 
+  left_join(sample_methylation_mvalues) %>% 
+  dplyr::select(
+    LobsterID,
+    Encounter,
+    tidyr::all_of(ewas_significant_loci)
+  )
+
+ewas_pca <- ewas_pca_lobster_samples %>%
+  dplyr::select(tidyr::all_of(ewas_significant_loci)) %>% 
+  stats::prcomp()
+
+ewas_pca_importances <- ewas_pca %>%
+  summary() %>%
+  magrittr::use_series("importance") %>% 
+  { .["Proportion of Variance", ] } %>% 
+  magrittr::multiply_by(100) %>% 
+  round(digits = 1)
+
+ewas_pca_data_longer <- ewas_pca %>% 
+  magrittr::use_series("x") %>% # Principal components
+  as.data.frame() %>% 
+  dplyr::select("PC1", "PC2") %>% 
+  cbind(ewas_pca_lobster_samples, .) %>% 
+  dplyr::select(LobsterID, Encounter, PC1, PC2)
+  
+ewas_pca_data_wider <- ewas_pca_data_longer %>% 
+  tidyr::pivot_wider(
+    values_from = c("PC1", "PC2"),
+    names_from = c("Encounter")
+  )
+```
+
+### Combined EWAS plot
+Then I make a plot of the PCA where arrows combine capture and recapture,
+so I can see the directionality of lobsters on PC1 and PC2 between
+capture and recapture. I also add box plots to show the distribution of
+capture and recapture samples on the principal components.
+Combining everything gives the final plot from the EWAS:
+```{r ewas_pca_plots}
+EWAS_PCA_XYLIMS_AESTHETIC_SCALEFACTOR <- 1.15
+
+ewas_pca_xlims <- c(
+  min(ewas_pca_data_longer$PC1) * EWAS_PCA_XYLIMS_AESTHETIC_SCALEFACTOR,
+  max(ewas_pca_data_longer$PC1) * EWAS_PCA_XYLIMS_AESTHETIC_SCALEFACTOR
+)
+
+ewas_pca_ylims <- c(
+  min(ewas_pca_data_longer$PC2) * EWAS_PCA_XYLIMS_AESTHETIC_SCALEFACTOR,
+  max(ewas_pca_data_longer$PC2) * EWAS_PCA_XYLIMS_AESTHETIC_SCALEFACTOR
+)
+
+plot_ewas_pca <- ewas_pca_data_wider %>% 
+  ggplot2::ggplot() +
+  ggplot2::geom_segment(
+    ggplot2::aes(
+      x = PC1_Capture,
+      xend = PC1_Recapture,
+      y = PC2_Capture,
+      yend = PC2_Recapture,
+      colour = PC1_Recapture - PC1_Capture
+    ),
+    arrow = grid::arrow(
+      length = ggplot2::unit(0.5, "lines"),
+      type = "closed"
+    )
+  ) +
+  ggplot2::geom_point(
+    aes(
+      x = (PC1_Recapture + PC1_Capture) / 2,
+      y = (PC2_Recapture + PC2_Capture) / 2,
+      fill = PC1_Recapture - PC1_Capture,
+      alpha = ifelse(PC1_Recapture < PC1_Capture, FALSE, TRUE)
+    ),
+    pch = 21,
+    size = 3.5,
+    show.legend = FALSE
+  ) +
+  ggplot2::xlab(
+    paste0(
+      "PC1 (",
+      ewas_pca_importances["PC1"],
+      " %) of methylation levels at significant CpGs in EWAS"
+    )
+    ) +
+  ggplot2::ylab(paste0("PC2 (", ewas_pca_importances["PC2"], " %)")) +
+  ggplot2::scale_x_continuous(position = "top", limits = ewas_pca_xlims) +
+  ggplot2::scale_y_continuous(limits = ewas_pca_ylims) +
+  ggplot2::scale_alpha_manual(values = c(1, 0)) +
+  ggplot2::scale_colour_distiller(
+      aesthetics = c("fill", "colour"),
+      guide = ggplot2::guide_colorbar(
+        title = "Change on PC1 at recapture",
+        display = "raster",
+        ticks.colour = NA,
+        frame.colour = "black",
+        frame.linewidth = 0.25,
+        title.position = "left",
+        title.theme = ggplot2::element_text(angle = 90, hjust = 0.5),
+        barheight = 15
+      ),
+      limits = ggh4x::center_limits(),
+      palette = "BrBG",
+      type = "div"
+  ) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "black"),
+    legend.background = ggplot2::element_rect(
+      colour = "black",
+      fill = "#ebebeb",
+      linewidth = 0.25
+    )
+  )
+
+plot_ewas_pca_pc1_densities <- ewas_pca_data_longer %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = PC1,
+      y = Encounter,
+      fill = Encounter
+    )
+  ) +
+  ggplot2::scale_fill_manual(values = c(CAP_COLOUR, RECAP_COLOUR)) +
+  ggplot2::scale_x_continuous(limits = ewas_pca_xlims) +
+  ggplot2::geom_boxplot(show.legend = FALSE, lwd = 0.25) +
+  ggsignif::geom_signif(
+    test = "t.test",
+    test.args = list("paired" = TRUE),
+    map_signif_level = TRUE,
+    comparisons = list(c("Capture", "Recapture"))
+  ) +
+  ggplot2::theme_void()
+
+plot_ewas_pca_pc2_densities <- ewas_pca_data_longer %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      y = PC2,
+      x = Encounter,
+      fill = Encounter
+    )
+  ) +
+  ggplot2::scale_fill_manual(values = c(CAP_COLOUR, RECAP_COLOUR)) +
+  ggplot2::scale_y_continuous(limits = ewas_pca_ylims) +
+  ggplot2::geom_boxplot(lwd = 0.25) +
+  ggsignif::geom_signif(
+    test = "t.test",
+    test.args = list("paired" = TRUE),
+    map_signif_level = TRUE,
+    comparisons = list(c("Capture", "Recapture"))
+  ) +
+  ggplot2::theme_void()
+
+plot_ewas_combined <- (
+  # Top row of plots
+  ( plot_ewas_manhattan | plot_ewas_effect_sizes ) +
+    # Layout for top row
+    patchwork::plot_layout(widths = c(8, 2))) /
+  # Bottom row of plots
+  (
+    # Collects bottom row and guide area
+    (
+      # "Top row" of bottom row, i.e. PC1 density plot
+      (
+        ( plot_ewas_pca | 
+            ( 
+              plot_ewas_pca_pc2_densities + 
+                patchwork::plot_layout(tag_level = "new")
+            )
+        ) + patchwork::plot_layout(widths = c(9.5, 0.5, 0.5)) # Top row layout
+      ) /
+        # Bottom row of bottom row
+        (
+          (
+            plot_ewas_pca_pc1_densities 
+          ) + patchwork::plot_layout(widths = c(9.5, 1.0), tag_level = "new")
+        ) + 
+        # Layout of bottom row
+        patchwork::plot_layout(heights = c(9, 1), guides = "collect") |
+        # Add guide area on side (|)
+        patchwork::guide_area()
+    ) + patchwork::plot_layout(widths = c(200, 1)) # Layout of row | guide_area
+  ) +
+  # Plot-wide (top / bottom layout and plot annotation)
+  patchwork::plot_layout(heights = c(2.5, 5)) +
+  patchwork::plot_annotation(tag_levels = "a")
+```
+```{r plot_combined_ewas_plot, fig.height = 7.5, fig.width = 10, echo = FALSE, warning = FALSE}
+plot_ewas_combined
+```
+
+Paired t-test results for the box plots:
+```{r ewas_pca_boxplot_stats, }
+# Implemented as linear mixed effect models for simplicity of data wrangling
+ewas_pca_data_longer %>%
+  lmerTest::lmer( # For PC1
+    PC1 ~ Encounter + (1 | LobsterID),
+    data = .
+  ) %>% summary()
+
+ewas_pca_data_longer %>% 
+  lmerTest::lmer( # For PC2
+    PC2 ~ Encounter + (1 | LobsterID),
+    data = .
+  ) %>% summary()
+```
+
+The labelled lobsters in the PCA Plot are seemingly heterogeneous...
+```{r labelled_pca_lobsters, class.source = 'fold-show'}
+labelled_lobster_ids <- ewas_pca_data_wider %>% 
+  dplyr::filter(PC1_Recapture < PC1_Capture) %>% 
+  dplyr::select(LobsterID) %>% 
+  unlist()
+
+labelled_lobsters_data <- lobsters %>%
+  dplyr::filter(LobsterID %in% labelled_lobster_ids)
+  
+labelled_lobsters_data %>% 
+  kableExtra::kbl() %>% 
+  kableExtra::kable_paper() %>% 
+  kableExtra::scroll_box(width = "100%")
+
+# Mean length stats
+labelled_lobsters_data %>% 
+  magrittr::use_series(MeanLengthCM) %>% 
+  {
+    range(.) %>% print()
+    mean(.) %>% print()
+    sd(.) %>% print()
+  }
+
+# Mean growth stats
+labelled_lobsters_data %>% 
+  magrittr::use_series(GrowthCM) %>% 
+  {
+    range(.) %>% print()
+    mean(.) %>% print()
+    sd(.) %>% print()
+  }
+```
+
+With EWAS-significant loci, I can now train new models.
+
+## Step 5: Training a new model
+I train two new models to see if I can describe the age intervals with linear
+combinations of CpG methylation changes. First across all loci, then across 
+the EWAS loci across all loci. I use `MonthsPassed` per sample as a response,
+and M values as predictors.
+
+### Capture-recapture methylation models
+#### Functionalise model training
+For simplicity, I quickly functionalise model training here ...
+```{r training_and_test_sets, message = FALSE, warning = FALSE, class.source = 'fold-show'}
+train_penalised_regression_from_dataset <- function(
+    ids_and_responses = lobster_samples %>% 
+      dplyr::select(
+        SampleNumber,
+        MonthsPassed
+      ),
+    ids_and_predictors = sample_methylation_mvalues,
+    alphas = seq(from = 0.5, to = 1.0, by = 0.5),
+    lambdas = 10 ^ seq(from = log10(1e-3), to = log10(1e3), length.out = 100),
+    cross_validation_settings = caret::trainControl(
+      "repeatedcv", number = 10, repeats = 10
+    ),
+    method = "glmnet",
+    family = "gaussian"
+)
+{
+  ids_responses_and_predictors_combined <- ids_and_responses %>% 
+    dplyr::left_join(ids_and_predictors)
+  
+  train_versus_test_split <- ids_responses_and_predictors_combined %>% 
+    rsample::initial_split(strata = MonthsPassed)
+  
+  ids_responses_and_predictors_train <- rsample::training(train_versus_test_split)
+  ids_responses_and_predictors_test <- rsample::testing(train_versus_test_split)
+  
+  responses_train <- ids_responses_and_predictors_train %>% 
+    dplyr::select(MonthsPassed)
+  predictors_train <- ids_responses_and_predictors_train %>% 
+    dplyr::select(dplyr::contains("CpG"))
+  responses_test <- ids_responses_and_predictors_test %>% 
+    dplyr::select(MonthsPassed)
+  predictors_test <- ids_responses_and_predictors_test %>% 
+    dplyr::select(dplyr::contains("CpG"))
+  
+  total_available_predictors <- ncol(predictors_train)
+  
+  near_zero_variance_cpgs <- predictors_train %>% 
+    caret::nearZeroVar(names = TRUE)
+  
+  predictors_train %<>% dplyr::select(-near_zero_variance_cpgs)
+  predictors_test %<>% dplyr::select(-near_zero_variance_cpgs)
+  
+  highly_correlated_cpgs <- predictors_train %>% 
+    stats::cor() %>% 
+    caret::findCorrelation(names = TRUE, exact = TRUE)
+  
+  predictors_train %<>% dplyr::select(-highly_correlated_cpgs)
+  predictors_test %<>% dplyr::select(-highly_correlated_cpgs)
+  
+  # Make transformer for scaling/centering based on TRAINING DATA ONLY
+  transformer_predictors_train <- caret::preProcess(predictors_train)
+  
+  # Scale and centre training and testing sets
+  predictors_train %<>% stats::predict(object = transformer_predictors_train)
+  predictors_test %<>% stats::predict(object = transformer_predictors_train)
+  
+  # Train model
+  penalised_regression <- caret::train(
+    x = as.matrix(predictors_train),
+    y = unlist(responses_train),
+    method = method,
+    family = family,
+    trControl = cross_validation_settings,
+    tuneGrid = expand.grid(
+      alpha = alphas,
+      lambda = lambdas
+    )
+  )
+  
+  return(
+    list(
+      `Penalised Regression` = penalised_regression,
+      `Test IDs` = ids_responses_and_predictors_test$SampleNumber,
+      `Train IDs` = ids_responses_and_predictors_train$SampleNumber,
+      `Test responses` = responses_test,
+      `Train responses` = responses_train,
+      `Train predictors` = predictors_train,
+      `Test predictors` = predictors_test,
+      `Total available CpGs` = total_available_predictors,
+      `Total available post-filtering CpGs` = total_available_predictors %>% 
+        subtract(length(near_zero_variance_cpgs)) %>% 
+        subtract(length(highly_correlated_cpgs)),
+      `Non-zero coefficients` = penalised_regression %>% 
+        { coef(.$finalModel, s = .$bestTune[["lambda"]]) } %>% 
+        as.matrix() %>% 
+        as.data.frame() %>% 
+        dplyr::filter(s1 != 0) %>% 
+        slice(-1),
+      `Intercept` = penalised_regression %>% 
+        { coef(.$finalModel, s = .$bestTune[["lambda"]]) } %>% 
+        as.matrix() %>% 
+        as.data.frame() %>% 
+        dplyr::filter(s1 != 0) %>% 
+        slice(1),
+      `Metrics` = as.data.frame(penalised_regression$bestTune) %>%
+        dplyr::left_join(
+          as.data.frame(penalised_regression$results),
+          by = c("alpha", "lambda")
+        )
+    )
+  )
+}
+```
+
+### Run model training
+```{r train_penalised_lms, warning = FALSE, message = FALSE, results = 'hide', class.source = 'fold-show'}
+all_loci_regression <- train_penalised_regression_from_dataset(alphas = 0.5)
+ewas_loci_regression <- train_penalised_regression_from_dataset(
+  alphas = 0.5,
+  ids_and_predictors = dplyr::select(
+    sample_methylation_mvalues,
+    SampleNumber,
+    tidyr::all_of(ewas_significant_loci)
+  )
+)
+```
+
+Here are the non-zero coefficients and accuracy metrics from each regression:
+```{r show_coefficients_allloci}
+all_loci_regression$`Non-zero coefficients`
+all_loci_regression$`Metrics`
+```
+
+```{r show_coefficients_ewasloci}
+ewas_loci_regression$`Non-zero coefficients`
+ewas_loci_regression$`Metrics`
+```
+
+
+### Collate predictions
+I collate the predictions from each model and bind the training and test
+predictions to the appropriate rows in `ageing_sample_estimates` data for later:
+```{r collate_ageing_predictions, message = FALSE, class.source = 'fold-show'}
+all_loci_predictions <- data.frame(
+  SampleNumber = c(
+    all_loci_regression$`Train IDs`,
+    all_loci_regression$`Test IDs`
+  ),
+  TestTrain = c(
+    rep("Train", length(all_loci_regression$`Train IDs`)),
+    rep("Test", length(all_loci_regression$`Test IDs`))
+  ),
+  AllLociMonths = c(
+    predict(all_loci_regression$`Penalised Regression`),
+    predict(
+      all_loci_regression$`Penalised Regression`,
+      all_loci_regression$`Test predictors`
+    )
+  )
+)
+
+ewas_loci_predictions <- data.frame(
+    SampleNumber = c(
+    ewas_loci_regression$`Train IDs`,
+    ewas_loci_regression$`Test IDs`
+  ),
+  TestTrain = c(
+    rep("Train", length(ewas_loci_regression$`Train IDs`)),
+    rep("Test", length(ewas_loci_regression$`Test IDs`))
+  ),
+  EWASLociMonths = c(
+    predict(ewas_loci_regression$`Penalised Regression`),
+    predict(
+      ewas_loci_regression$`Penalised Regression`,
+      ewas_loci_regression$`Test predictors`
+    )
+  )
+)
+
+penalised_regressions_predictions <- all_loci_predictions %>%
+  full_join(ewas_loci_predictions)
+
+# Join all data plus real months passed.
+ageing_sample_estimates %<>%
+  left_join(penalised_regressions_predictions) %>% 
+  left_join(lobster_samples %>% dplyr::select(SampleNumber, MonthsPassed))
+```
+
+## Step 6: Model comparison
+### Venn diagram of different models
+We can see which loci the models share with each other and with the original
+Fairfield paper model with a Venn diagram:
+```{r make_venn_diagram}
+venn_diagram_data <- tidyr::tibble(
+  Value = loci_in_order,
+  `Fairfield` = loci_in_order %in% names(FAIRFIELD_ELASTICNET_CpG),
+  `Elastic Net` = loci_in_order %in% rownames(all_loci_regression$`Non-zero coefficients`),
+  `EWAS + Elastic Net` = loci_in_order %in% rownames(ewas_loci_regression$`Non-zero coefficients`)
+)
+
+plot_venn_diagram <- venn_diagram_data %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      A = `Fairfield`,
+      B = `Elastic Net`,
+      C = `EWAS + Elastic Net`,
+    )
+  ) +
+  ggvenn::geom_venn(
+    show_percentage = FALSE,
+    stroke_size = 0.25,
+    text_size = 3,
+    set_name_size = 3, 
+    fill_color = MODEL_COLOURS
+  ) +
+  ggplot2::coord_fixed() +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "black"),
+    axis.ticks = ggplot2::element_blank(),
+    axis.text = ggplot2::element_blank(),
+    plot.margin = ggplot2::unit(c(0,0,0,0), "lines")
+  )
+```
+```{r plot_ewas_venn_diagram_plot, fig.align='center',fig.width = 5, fig.height = 5, echo = FALSE}
+plot_venn_diagram
+```
+
+### Compare interval estimates
+I compare the interval estimation performance of my two new models and the
+Fairfield model. As I did in Step 3, I have to calculate the intervals and
+related metrics:
+```{r new_model_metrics, warning = FALSE, class.source = 'fold-show'}
+for (row in seq_len(nrow(ageing_lobster_metrics)))
+{
+  lobster_id <- ageing_lobster_metrics$LobsterID[row]
+  lobster_known_interval <- ageing_lobster_metrics$KnownIntervalMonths[row]
+  
+  capture_sample <- ageing_lobster_metrics$CaptureSampleNumber[row]
+  recapture_sample <- ageing_lobster_metrics$RecaptureSampleNumber[row]
+  
+  lobster_age_estimates <- ageing_sample_estimates %>% 
+    dplyr::filter(LobsterID == lobster_id)
+  
+  all_loci_age_estimates <- lobster_age_estimates %>%
+    dplyr::select(SampleNumber, AllLociMonths) %>% 
+    tidyr::drop_na(AllLociMonths)
+  
+  all_loci_capture_estimate <- all_loci_age_estimates %>% 
+    dplyr::filter(SampleNumber == capture_sample) %>% 
+    magrittr::use_series(AllLociMonths)
+  
+  all_loci_recapture_estimate <- all_loci_age_estimates %>% 
+    dplyr::filter(SampleNumber == recapture_sample) %>% 
+    magrittr::use_series(AllLociMonths)
+  
+  ewas_loci_age_estimates <- lobster_age_estimates %>% 
+    dplyr::select(SampleNumber, EWASLociMonths) %>% 
+    tidyr::drop_na()
+  
+  ewas_loci_capture_estimate <- ewas_loci_age_estimates %>% 
+    dplyr::filter(SampleNumber == capture_sample) %>%
+    magrittr::use_series(EWASLociMonths)
+  
+  ewas_loci_recapture_estimate <- ewas_loci_age_estimates %>% 
+    dplyr::filter(SampleNumber == recapture_sample) %>% 
+    magrittr::use_series(EWASLociMonths)
+  
+  all_loci_estimates <- c(all_loci_capture_estimate, all_loci_recapture_estimate)
+  all_loci_interval_estimate <- all_loci_estimates[2] - all_loci_estimates[1]
+
+  all_loci_interval_error <- lobster_known_interval - all_loci_interval_estimate
+  all_loci_abs_error <- abs(all_loci_interval_error)
+  all_loci_relative_error <- all_loci_abs_error / lobster_known_interval
+  
+  ewas_loci_estimates <- c(ewas_loci_capture_estimate, ewas_loci_recapture_estimate)
+  ewas_loci_interval_estimate <- ewas_loci_estimates[2] - ewas_loci_estimates[1]
+  
+  ewas_loci_interval_error <- lobster_known_interval - ewas_loci_interval_estimate
+  ewas_loci_abs_error <- abs(ewas_loci_interval_error)
+  ewas_loci_relative_error <- ewas_loci_abs_error / lobster_known_interval
+  
+  ageing_lobster_metrics$AllLociCaptureMonths[row] <- all_loci_estimates[1]
+  ageing_lobster_metrics$AllLociRecaptureMonths[row] <- all_loci_estimates[2]
+  ageing_lobster_metrics$AllLociIntervalMonths[row] <- all_loci_interval_estimate
+  ageing_lobster_metrics$AllLociIntervalError[row] <- all_loci_interval_error
+  ageing_lobster_metrics$AllLociIntervalAbsError[row] <- all_loci_abs_error
+  ageing_lobster_metrics$AllLociIntervalRelativeError[row] <- all_loci_relative_error
+  
+  ageing_lobster_metrics$EWASLociCaptureMonths[row] <- ewas_loci_estimates[1]
+  ageing_lobster_metrics$EWASLociRecaptureMonths[row] <- ewas_loci_estimates[2]
+  ageing_lobster_metrics$EWASLociIntervalMonths[row] <- ewas_loci_interval_estimate
+  ageing_lobster_metrics$EWASLociIntervalError[row] <- ewas_loci_interval_error
+  ageing_lobster_metrics$EWASLociIntervalAbsError[row] <- ewas_loci_abs_error
+  ageing_lobster_metrics$EWASLociIntervalRelativeError[row] <- ewas_loci_relative_error
+}
+```
+
+Then, reformat the dataset ...
+```{r new_model_metrics_long, class.source = 'fold-show'}
+ageing_lobster_metrics_long <- ageing_lobster_metrics %>% 
+  dplyr::select(LobsterID, contains("Interval")) %>% 
+  rename(RealMonths = KnownIntervalMonths) %>% 
+  tidyr::pivot_longer(
+    cols = contains("Interval"),
+    names_pattern = "(.*)Interval(.*)",
+    names_to = c("Model", "Metric"),
+    names_transform = as.factor
+  ) %>% 
+  tidyr::pivot_wider(names_from = Metric) %>% 
+  dplyr::mutate(
+    Model = factor(Model, levels = c("Fairfield", "AllLoci", "EWASLoci"))
+  )
+```
+
+... make a comparison plot for later:
+```{r plot_model_comparison}
+plot_model_comparison <- ageing_lobster_metrics_long %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = Model,
+      y = RelativeError,
+      fill = Model
+    )
+  ) +
+  ggplot2::ylab("Relative error of intervals") +
+  ggplot2::xlab("") +
+  ggplot2::geom_hline(yintercept = 0, lty = 2) +
+  ggplot2::geom_boxplot(show.legend = FALSE) +
+  ggplot2::scale_fill_manual(values = MODEL_COLOURS) +
+  ggplot2::scale_x_discrete(labels = c("Fairfield", "EN", "EWAS + EN")) +
+  ggtheme_scatter
+```
+
+### Model comparison stats
+But first! Compare with ANOVA and a post-hoc Tukey test:
+```{r model_comparison_anova, class.source = 'fold.show', results = 'hold'}
+models_anova <- stats::aov(RelativeError ~ Model, data = ageing_lobster_metrics_long)
+summary(models_anova)
+stats::TukeyHSD(models_anova)
+```
+
+As included in the article/thesis, the underestimation of the intervals:
+```{r important_mode_summary_stats}
+ageing_lobster_metrics %>% 
+  magrittr::use_series(AllLociIntervalAbsError) %>% 
+  unlist() %>% 
+  {
+    mean(.) %>% print()
+    sd(.) %>% print()
+  }
+```
+
+### Final comparison plot
+Now I can plot these results along with the estimated vs. known for the trained
+models. I also compare the model performance on the training and test sets and
+show the coefficient values:
+```{r make_comparison_figure, message = FALSE}
+# Top right (main)
+plot_all_loci_predicted_vs_known_interval <- ageing_sample_estimates %>%
+  dplyr::select(LobsterID, MonthsPassed, AllLociMonths, TestTrain) %>% 
+  tidyr::drop_na(AllLociMonths) %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = MonthsPassed,
+      y = AllLociMonths,
+      fill = TestTrain
+    )
+  ) +
+  # Coordinate system
+  ggplot2::geom_abline(slope = 1, intercept = 0, lty = 2, lwd = 0.5) +
+  ggplot2::geom_vline(xintercept = 0, lty = 1, lwd = 0.5, alpha = 0.1) +
+  ggplot2::geom_hline(yintercept = 0, lty = 1, lwd = 0.5, alpha = 0.1) +
+  ggplot2::xlab("Known time since first capture (months)") +
+  ggplot2::ylab("Estimated time since first capture (months)") +
+  ggplot2::ylim(
+    min(
+      ageing_sample_estimates$AllLociMonths,
+      ageing_sample_estimates$MonthsPassed,
+      na.rm = TRUE
+    ),
+    max(
+      ageing_sample_estimates$AllLociMonths,
+      ageing_sample_estimates$MonthsPassed,
+      na.rm = TRUE
+    )
+  ) +
+  ggplot2::xlim(
+    min(
+      ageing_sample_estimates$AllLociMonths,
+      ageing_sample_estimates$MonthsPassed,
+      na.rm = TRUE
+    ),
+    max(
+      ageing_sample_estimates$AllLociMonths,
+      ageing_sample_estimates$MonthsPassed,
+      na.rm = TRUE
+    )
+  ) +
+  # Lines between points
+  ggplot2::geom_line(
+    ggplot2::aes(
+      group = LobsterID
+    ),
+    col = LINE_COLOUR,
+    alpha = LINE_ALPHA
+  ) +
+  # Points on top
+  ggplot2::geom_point(pch = 21, size = POINT_SIZE, show.legend = FALSE) +
+  ggplot2::scale_fill_manual(values = MODEL_TEST_TRAIN_COLOURS[1:2]) +
+  ggplot2::ggtitle(
+    paste0(
+      "Elastic Net (",
+      all_loci_regression$`Total available CpGs`, "/",
+      all_loci_regression$`Total available post-filtering CpGs`, "/",
+      nrow(all_loci_regression$`Non-zero coefficients`),
+      ")"
+    )
+  ) +
+  ggplot2::theme(plot.title = element_text(vjust = -10, hjust = 0.1)) +
+  ggtheme_scatter
+
+plot_ewas_loci_predicted_vs_known_interval <- ageing_sample_estimates %>%
+  dplyr::select(LobsterID, MonthsPassed, EWASLociMonths, TestTrain) %>% 
+  tidyr::drop_na(EWASLociMonths) %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = MonthsPassed,
+      y = EWASLociMonths,
+      fill = TestTrain
+    )
+  ) +
+  # Coordinate system
+  ggplot2::geom_abline(slope = 1, intercept = 0, lty = 2, lwd = 0.5) +
+  ggplot2::geom_vline(xintercept = 0, lty = 1, lwd = 0.5, alpha = 0.1) +
+  ggplot2::geom_hline(yintercept = 0, lty = 1, lwd = 0.5, alpha = 0.1) +
+  ggplot2::xlab("Known time since first capture (months)") +
+  ggplot2::ylab("Estimated time since first capture (months)") +
+  ggplot2::ylim(
+    min(
+      ageing_sample_estimates$AllLociMonths,
+      ageing_sample_estimates$MonthsPassed,
+      na.rm = TRUE
+    ),
+    max(
+      ageing_sample_estimates$AllLociMonths,
+      ageing_sample_estimates$MonthsPassed,
+      na.rm = TRUE
+    )
+  ) +
+  ggplot2::xlim(
+    min(
+      ageing_sample_estimates$AllLociMonths,
+      ageing_sample_estimates$MonthsPassed,
+      na.rm = TRUE
+    ),
+    max(
+      ageing_sample_estimates$AllLociMonths,
+      ageing_sample_estimates$MonthsPassed,
+      na.rm = TRUE
+    )
+  ) +
+  # Lines between points
+  ggplot2::geom_line(
+    ggplot2::aes(
+      group = LobsterID
+    ),
+    col = LINE_COLOUR,
+    alpha = LINE_ALPHA
+  ) +
+  # Points on top
+  ggplot2::geom_point(pch = 21, size = POINT_SIZE, show.legend = FALSE) +
+  ggplot2::scale_fill_manual(values = MODEL_TEST_TRAIN_COLOURS[3:4]) +
+  ggplot2::ggtitle(
+    paste0(
+      "EWAS + Elastic Net (",
+      ewas_loci_regression$`Total available CpGs`, "/",
+      ewas_loci_regression$`Total available post-filtering CpGs`, "/",
+      nrow(ewas_loci_regression$`Non-zero coefficients`),
+      ")"
+    )
+  ) +
+  ggplot2::theme(plot.title = element_text(vjust = -10, hjust = 0.1)) +
+  ggtheme_scatter
+
+plot_all_loci_test_train_errors <- ageing_sample_estimates %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = TestTrain,
+      y = abs(AllLociMonths - MonthsPassed),
+      fill = TestTrain
+    )
+  ) +
+  ggplot2::ylab("Abs. error (months past cap.)") +
+  ggplot2::xlab("Dataset") +
+  ggplot2::geom_boxplot(
+    staplewidth = 0.25,
+    outliers = FALSE,
+    show.legend = FALSE,
+    fill = MODEL_TEST_TRAIN_COLOURS[1:2]
+  ) +
+  ggplot2::geom_point(
+    pch = 21,
+    alpha = 0.5,
+    size = POINT_SIZE,
+    show.legend = FALSE,
+    position = ggplot2::position_jitter(width = 0.1)
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, max(ageing_sample_estimates$MonthsPassed)),
+    expand = c(0,0)
+  ) +
+  ggplot2::scale_fill_manual(values = MODEL_TEST_TRAIN_COLOURS[1:2]) +
+  ggtheme_scatter
+
+plot_ewas_loci_test_train_errors <- ageing_sample_estimates %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = TestTrain,
+      y = abs(EWASLociMonths - MonthsPassed),
+      fill = TestTrain
+    )
+  ) +
+  ggplot2::ylab("Abs. error (months past cap.)") +
+  ggplot2::xlab("Dataset") +
+  ggplot2::geom_boxplot(
+    staplewidth = 0.25,
+    outliers = FALSE,
+    show.legend = FALSE,
+    fill = MODEL_TEST_TRAIN_COLOURS[3:4]
+  ) +
+  ggplot2::geom_point(
+    pch = 21,
+    alpha = 0.5,
+    size = POINT_SIZE,
+    show.legend = FALSE,
+    position = ggplot2::position_jitter(width = 0.1)
+  ) +
+  ggplot2::scale_y_continuous(
+    limits = c(0, max(ageing_sample_estimates$MonthsPassed)),
+    expand = c(0,0)
+  ) +
+  ggplot2::scale_fill_manual(values = MODEL_TEST_TRAIN_COLOURS[3:4]) +
+  ggtheme_scatter
+
+plot_all_loci_coefficients <- all_loci_regression$`Non-zero coefficients` %>% 
+  dplyr::rename(Value = s1) %>% 
+  dplyr::mutate(Coefficient = rownames(.)) %>% 
+  dplyr::arrange(desc(Value)) %>% 
+  dplyr::mutate(Coefficient = factor(Coefficient, levels = Coefficient)) %>% 
+  ggplot2::ggplot(
+    aes(
+      y = Value,
+      x = Coefficient
+    )
+  ) + 
+  geom_col(fill = MODEL_TEST_TRAIN_COLOURS[2]) +
+  geom_hline(yintercept = 0) +
+  scale_y_continuous(expand = c(0, 0), limits = ggh4x::center_limits()) +
+  scale_x_discrete(expand = c(0.05, 0.05)) +
+  theme_classic() +
+  theme(
+    axis.line.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank()
+  )
+
+plot_ewas_loci_coefficients <- ewas_loci_regression$`Non-zero coefficients` %>% 
+  dplyr::rename(Value = s1) %>% 
+  dplyr::mutate(Coefficient = rownames(.)) %>% 
+  dplyr::arrange(desc(Value)) %>% 
+  dplyr::mutate(Coefficient = factor(Coefficient, levels = Coefficient)) %>% 
+  ggplot2::ggplot(
+    aes(
+      y = Value,
+      x = Coefficient
+    )
+  ) + 
+  geom_col(fill = MODEL_TEST_TRAIN_COLOURS[4]) +
+  geom_hline(yintercept = 0) +
+  scale_y_continuous(expand = c(0, 0), limits = ggh4x::center_limits()) +
+  scale_x_discrete(expand = c(0.2, 0.2)) +
+  theme_classic() +
+  theme(
+    axis.line.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank()
+  )
+
+plot_model_comparison_figure <- (
+  ( plot_venn_diagram / plot_model_comparison + xlab("Model") ) | 
+    (
+      (
+        plot_all_loci_predicted_vs_known_interval |
+          plot_ewas_loci_predicted_vs_known_interval
+      ) /
+        (
+          plot_all_loci_test_train_errors |
+            plot_all_loci_coefficients + ylab("Value (descending)") |
+            plot_ewas_loci_test_train_errors |
+            plot_ewas_loci_coefficients + ylab("Value (descending)")
+        )
+    ) + plot_layout(heights = c(4.5, 3))
+) + plot_layout(widths = c(2,8)) + plot_annotation(tag_levels = "a")
+```
+```{r fig.height = 7.5, fig.width = 10, warning = FALSE, echo = FALSE}
+plot_model_comparison_figure
+```
+
+## Step 7: Revisit Fairfield data
+I take the loci from my best updated model and see how well an epigenetic
+clock trained on them works for the Fairfield data.
+
+### Load the Fairfield data
+First, load their original dataset and format it similar to how I've formatted
+our own data in my earlier analyses (just for consistency and convenience):
+```{r load_fairfield_data, class.source = 'fold-show'}
+fairfield_lobster_methylation <- FAIRFIELD_DATA_PATH %>% 
+  readxl::read_xls() %>% 
+  dplyr::select(-`carapace size mm`, -`sex`, -`age description`) %>% 
+  dplyr::rename(LobsterID = `sample ID`) %>% 
+  dplyr::rename(KnownAgeMonths = `age_months`) %>% 
+  dplyr::rename_with(
+    .cols = dplyr::starts_with("18S_"),
+    .fn = ~ stringr::str_replace(.x, "18S", "CpG_18S_ITS1")
+  ) %>% 
+  dplyr::rename_with(
+    .cols = dplyr::starts_with("ITS1_"),
+    .fn = ~ stringr::str_replace(.x, "ITS1", "CpG_18S_ITS1")
+  ) %>% 
+  dplyr::rename_with(
+    .cols = dplyr::starts_with("ITS2_"),
+    .fn = ~ stringr::str_replace(.x, "ITS2", "CpG_ITS2_28S")
+  ) %>% 
+  dplyr::rename_with(
+    .cols = dplyr::starts_with("28S_"),
+    .fn = ~ stringr::str_replace(.x, "28S", "CpG_ITS2_28S")
+  )
+```
+
+Drop individuals with unknown age:
+```{r fairfield_data_drop_unknown_ages, class.source = 'fold-show'}
+fairfield_lobster_methylation %<>% tidyr::drop_na(KnownAgeMonths)
+```
+
+### Functionalising comparisons ...
+I make some functions to compare Fairfield et al.'s and our data with multiple
+combinations of loci ...
+
+#### Function to train a model
+```{r penalised_regressions, message = FALSE, warning = FALSE, class.source = 'fold-show'}
+run_regression_on_fairfield_data <- function(chosen_loci, model_name)
+{
+  train_versus_test_split <- fairfield_lobster_methylation %>% 
+    rsample::initial_split(strata = KnownAgeMonths)
+  
+  ids_responses_and_predictors_train <- rsample::training(train_versus_test_split)
+  ids_responses_and_predictors_test <- rsample::testing(train_versus_test_split)
+  
+  responses_train <- ids_responses_and_predictors_train %>% 
+    dplyr::select(KnownAgeMonths)
+  predictors_train <- ids_responses_and_predictors_train %>% 
+    dplyr::select(chosen_loci)
+  responses_test <- ids_responses_and_predictors_test %>% 
+    dplyr::select(KnownAgeMonths)
+  predictors_test <- ids_responses_and_predictors_test %>% 
+    dplyr::select(chosen_loci)
+  
+  # Only step that is different from earlier training: remember to convert to M!
+  predictors_train %<>%
+    apply(MARGIN = c(1, 2), FUN = convert_beta_to_m) %>% 
+    as.data.frame()
+  predictors_test %<>%
+    apply(MARGIN = c(1, 2), FUN = convert_beta_to_m) %>% 
+    as.data.frame()
+  
+  near_zero_variance_cpgs <- predictors_train %>% 
+    caret::nearZeroVar(names = TRUE)
+  
+  predictors_train %<>% dplyr::select(-near_zero_variance_cpgs)
+  predictors_test %<>% dplyr::select(-near_zero_variance_cpgs)
+  
+  highly_correlated_cpgs <- predictors_train %>% 
+    stats::cor() %>% 
+    caret::findCorrelation(names = TRUE, exact = TRUE)
+  
+  predictors_train %<>% dplyr::select(-highly_correlated_cpgs)
+  predictors_test %<>% dplyr::select(-highly_correlated_cpgs)
+  
+  # Make transformer for scaling/centering based on TRAINING DATA ONLY
+  transformer_predictors_train <- caret::preProcess(predictors_train)
+  
+  # Scale and centre training and testing sets
+  predictors_train %<>% stats::predict(object = transformer_predictors_train)
+  predictors_test %<>% stats::predict(object = transformer_predictors_train)
+  
+  # Model training steps
+  cross_validation_settings <- caret::trainControl(
+    method = "repeatedcv",
+    number = 10,
+    repeats = 10
+  )
+  
+  # Train model
+  penalised_regression <- caret::train(
+    x = as.matrix(predictors_train),
+    y = unlist(responses_train),
+    method = "glmnet",
+    family = "gaussian",
+    trControl = cross_validation_settings,
+    tuneGrid = expand.grid(
+      alpha = 0.5,
+      lambda = 10 ^ seq(from = -3, to = 3, length.out = 100)
+    )
+  )
+  
+  coefficients <- coef(
+    penalised_regression$finalModel,
+    s = penalised_regression$bestTune[["lambda"]]
+  )
+  
+  non_zero_coefficients <- coefficients %>% 
+    as.matrix() %>% 
+    as.data.frame() %>% 
+    dplyr::filter(s1 != 0) %>% 
+    slice(-1) # Minus the intercept!
+  
+  # (CpG AVAILABLE / AFTER FILTERING / RETAINED AFTER MODEL TRAINING)
+  regression_plot_title <- paste0(
+    model_name, " (",
+    length(chosen_loci),
+    "/",
+    length(chosen_loci) - length(near_zero_variance_cpgs) - length(highly_correlated_cpgs),
+    "/",
+    nrow(non_zero_coefficients), 
+    ")"
+  )
+  
+  regression_plot <- tidyr::tibble(
+    `Estimated age (months)` = predict(penalised_regression),
+    `Known age (months)` = unlist(responses_train$KnownAgeMonths)
+  ) %>% 
+    ggplot2::ggplot(
+      ggplot2::aes(
+        x = `Known age (months)`,
+        y = `Estimated age (months)`
+      )
+    ) +
+    ggplot2::geom_smooth(method = "lm", colour = "black") +
+    ggplot2::geom_point(aes(colour = "Training set"), size = 2) +
+    ggplot2::geom_point(
+      data = data.frame(
+        TestAgeEstimates = predict(penalised_regression, predictors_test),
+        TestAgeActual = unlist(responses_test$KnownAgeMonths)
+      ),
+      mapping = ggplot2::aes(
+        colour = "Test set",
+        x = TestAgeActual,
+        y = TestAgeEstimates
+      ),
+      size = 0.75,
+    ) +
+    scale_colour_manual(
+      values = c(
+        `Training set` = "olivedrab3",
+        `Test set` = "black"
+      )
+    ) +
+    ggplot2::ggtitle(regression_plot_title) +
+    ggplot2::theme(
+      legend.background = element_rect(fill = NA, colour = NA),
+      legend.key = element_rect(fill = NA, colour = NA),
+      legend.position = "inside",
+      legend.position.inside = c(0.25, 0.9),
+      legend.title = element_blank(),
+      plot.title = ggplot2::element_text(
+        vjust = -5,
+        hjust = 0.5,
+        size = 12,
+        margin = ggplot2::margin(t = -5)
+      )
+    ) +
+    ggtheme_scatter
+  
+  coefficient_inset_plot <- non_zero_coefficients %>% 
+  dplyr::rename(Value = s1) %>% 
+  dplyr::mutate(Coefficient = rownames(.)) %>% 
+  dplyr::arrange(desc(Value)) %>% 
+  dplyr::mutate(Coefficient = factor(Coefficient, levels = Coefficient)) %>% 
+  ggplot2::ggplot(
+    aes(
+      y = Value,
+      x = Coefficient
+    )
+  ) + 
+  geom_col() +
+  geom_hline(yintercept = 0) +
+  scale_y_continuous(expand = c(0, 0), limits = ggh4x::center_limits()) +
+  scale_x_discrete(name = "Coeff.", expand = c(0.1, 0.1)) +
+  theme_classic() +
+  theme(
+    axis.line.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank(),
+    plot.background = element_rect(fill = NA, colour = NA),
+    panel.background = element_rect(fill = NA, colour = NA)
+  )
+  
+  combined_regression_plot <- regression_plot + 
+    inset_element(
+      coefficient_inset_plot,
+      left = 0.5, right = 1, top = 0.5, bottom = 0
+    )
+  
+  return(
+    list(
+      `Regression` = penalised_regression,
+      `Coefficients` = coefficients,
+      `Non-zero coefficients` = non_zero_coefficients,
+      `Plot` = combined_regression_plot,
+      `Metrics` = as.data.frame(penalised_regression$bestTune) %>%
+        dplyr::left_join(
+          as.data.frame(penalised_regression$results),
+          by = c("alpha", "lambda")
+        )
+    )
+  )
+}
+```
+
+#### Combined PCA functions
+I can run a PCA on both Fairfield et al.'s original data and ours, to
+see if there is some clear trend with age and time between recaptures - they,
+after all, have known age samples. I functionalise these steps so I can try
+different locus combinations.
+
+First, a function to combine the methylation datasets and remove any columns
+with values that will conflict with the PCA. Also convert to M values:
+```{r combine_fairfields_and_our_data, warning = FALSE, message = FALSE, class.source = 'fold-show'}
+combine_datasets_at_chosen_loci <- function(chosen_loci) {
+  # I use the beta values from our data here so I can convert everything below
+  combined_lobster_samples_and_beta_values <- lobster_samples %>% 
+    dplyr::select(LobsterID, SampleNumber, Encounter) %>% 
+    dplyr::left_join(sample_methylation) %>% 
+    dplyr::bind_rows(fairfield_lobster_methylation) %>% 
+    dplyr::relocate(KnownAgeMonths, .after = Encounter) %>% 
+    dplyr::select(
+      LobsterID,
+      SampleNumber,
+      Encounter,
+      KnownAgeMonths,
+      tidyselect::where(~ ! any(is.na(.x)))
+    )
+  
+  # Retain the loci that were used for the re-trained model on Fairfield's data
+  combined_methylation_mvalues <- combined_lobster_samples_and_beta_values %>% 
+    dplyr::select(tidyselect::contains("CpG")) %>% 
+    apply(MARGIN = c(1, 2), FUN = convert_beta_to_m) %>% 
+    as.data.frame() %>%
+    dplyr::select(tidyselect::all_of(chosen_loci))
+  
+  # Remove any columns with NA variances (near-zero numeric errors)
+  combined_methylation_mvalues %<>%
+    sapply(var) %>% is.na() %>% which() %>% names() %>% 
+    {
+      dplyr::select(
+        -tidyselect::all_of(.),
+        .data = combined_methylation_mvalues
+      )
+    }
+  
+  return(
+    list(
+      `Combined sample data` = combined_lobster_samples_and_beta_values,
+      `Combined M-values` = combined_methylation_mvalues
+    )
+  )
+}
+```
+
+Then a function to run the PCA itself and extract the necessary data:
+```{r comparison_pca, warning = FALSE, message = FALSE, class.source = 'fold-show'}
+run_comparative_pca <- function(
+    combined_methylation_mvalues,
+    combined_lobster_samples_and_beta_values
+)
+{
+  combined_methylation_mvalues_pca <- prcomp(combined_methylation_mvalues)
+  
+  comparison_pca_plot_data <- combined_lobster_samples_and_beta_values %>% 
+    dplyr::select(LobsterID, Encounter, KnownAgeMonths) %>%
+    cbind(combined_methylation_mvalues_pca$x[,c("PC1", "PC2")])
+  
+  combined_pca_importances <- combined_methylation_mvalues_pca %>%
+    summary() %>%
+    magrittr::use_series("importance") %>% 
+    { .["Proportion of Variance", ] } %>% 
+    magrittr::multiply_by(100) %>% 
+    round(digits = 1)
+  
+  combined_pca_xlims <- c(
+    comparison_pca_plot_data$PC1 %>% min(),
+    comparison_pca_plot_data$PC1 %>% max()
+  )
+  
+  return(
+    list(
+      `Plot data` = comparison_pca_plot_data,
+      `Importances` = combined_pca_importances,
+      `Plot X-limits` = combined_pca_xlims
+    )
+  )
+}
+```
+
+Finally, a function to plot the results:
+```{r comparison_pca_plot, class.source = 'fold-show'}
+make_combined_pca_plot <- function(
+    comparison_pca_plot_data,
+    combined_pca_importances,
+    combined_pca_xlims,
+    number_of_loci_in_pca
+)
+{
+  plot_comparison_pca <- comparison_pca_plot_data %>% 
+    tidyr::pivot_wider(
+      values_from = c("PC1", "PC2"),
+      names_from = c("Encounter")
+    ) %>% 
+    dplyr::mutate(PC1_Capture = ifelse(is.na(PC1_Capture), PC1_NA, PC1_Capture)) %>% 
+    dplyr::mutate(PC2_Capture = ifelse(is.na(PC2_Capture), PC2_NA, PC2_Capture)) %>% 
+    dplyr::select(-PC1_NA, -PC2_NA) %>% 
+    ggplot2::ggplot(
+      ggplot2::aes(
+        x = PC1_Capture,
+        xend = PC1_Recapture,
+        y = PC2_Capture,
+        yend = PC2_Recapture,
+        fill = KnownAgeMonths,
+        colour = PC1_Recapture - PC1_Capture
+      )
+    ) +
+    ggplot2::xlab(
+      paste0(
+        "PC1 (",
+        combined_pca_importances["PC1"],
+        " %) of N = ",
+        number_of_loci_in_pca,
+        " CpGs"
+      )
+    ) +
+    ggplot2::ylab(paste0("PC2 (", combined_pca_importances["PC2"], " %)")) +
+    ggplot2::geom_segment(
+      ggplot2::aes(group = LobsterID),
+      arrow = grid::arrow(type = "closed", length = unit(0.25, "lines")),
+      lwd = 1.25
+    ) +
+    ggplot2::geom_point(
+      ggplot2::aes(alpha = !is.na(KnownAgeMonths) | is.na(PC1_Recapture)),
+      pch = 21,
+      size = 2.5,
+      colour = "black"
+    ) +
+    ggplot2::guides(
+      alpha = ggplot2::guide_none(),
+      fill = ggplot2::guide_colourbar(
+        order = 1,
+        title = "Age (months)",
+        display = "raster",
+        ticks.colour = NA,
+        frame.colour = "black",
+        frame.linewidth = 0.25,
+        title.position = "left",
+        title.theme = ggplot2::element_text(angle = 90, hjust = 0.5)
+      ),
+      colour = ggplot2::guide_colourbar(
+        order = 2,
+        title = expression(Delta*" PC1"),
+        display = "raster",
+        ticks.colour = NA,
+        frame.colour = "black",
+        frame.linewidth = 0.25,
+        title.position = "left",
+        title.theme = ggplot2::element_text(angle = 90, hjust = 0.5),
+        barheight = 4.4
+      )
+    ) +
+    ggplot2::scale_x_continuous(limits = combined_pca_xlims, position = "top") +
+    ggplot2::scale_alpha_manual(values = c(0, 1)) +
+    ggplot2::scale_fill_distiller(palette = "OrRd") +
+    ggplot2::scale_colour_distiller(
+      palette = "BrBG",
+      type = "div",
+      limits = ggh4x::center_limits()
+    ) +
+    ggplot2::theme(
+      panel.grid = ggplot2::element_blank(),
+      panel.border = ggplot2::element_rect(fill = NA, colour = "black"),
+      legend.background = ggplot2::element_rect(
+        colour = "black",
+        fill = "#ebebeb",
+        linewidth = 0.25
+      )
+    )
+  
+  plot_pca_comparison_boxplot <- comparison_pca_plot_data %>% 
+    tidyr::drop_na(Encounter) %>% 
+    ggplot2::ggplot(
+      ggplot2::aes(
+        x = PC1,
+        y = Encounter,
+        fill = Encounter
+      )
+    ) +
+    ggplot2::scale_fill_manual(values = c(CAP_COLOUR, RECAP_COLOUR)) +
+    ggplot2::scale_x_continuous(limits = combined_pca_xlims) +
+    ggplot2::scale_y_discrete(labels = c("Cap.", "Rec.")) +
+    ggplot2::geom_boxplot(lwd = 0.25, show.legend = FALSE) +
+    ggsignif::geom_signif(
+      test = "t.test",
+      test.args = list("paired" = TRUE),
+      map_signif_level = TRUE,
+      comparisons = list(c("Capture", "Recapture"))
+    ) +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      axis.text.y = ggplot2::element_text(size = 9)
+    )
+  
+  # Output results of paired t test (implemented with lmer)
+  comparison_pca_plot_data %>% 
+    lmerTest::lmer(
+      data = .,
+      PC1 ~ Encounter + (1 | LobsterID)
+    ) %>% 
+    summary() %>% 
+    print()
+  
+  plot_comparison_pca <- (
+    plot_comparison_pca /
+      (
+        plot_pca_comparison_boxplot + patchwork::plot_layout(tag_level = "new")
+      ) +
+      patchwork::plot_layout(heights = c(3.5, 0.5))
+  )
+  
+  return(plot_comparison_pca)
+}
+```
+
+### Comparisons with Fairfield data
+Now I run this pipeline across three sets of loci,
+outputting some stats as we go:
+```{r run_fairfield_comparative_analyses, warning = FALSE, message = FALSE, class.source = 'fold-show'}
+CHOSEN_LOCUS_SETS <- list(
+  `Fairfield CpGs` = names(FAIRFIELD_ELASTICNET_CpG),
+  `Elastic Net CpGs` = rownames(all_loci_regression$`Non-zero coefficients`),
+  `EWAS CpGs` = ewas_significant_loci
+)
+
+all_plots <- NULL
+
+for (locus_set_name in names(CHOSEN_LOCUS_SETS)) 
+{
+  chosen_loci_in_fairfield_data <- CHOSEN_LOCUS_SETS[[locus_set_name]] %>% 
+    magrittr::is_in(colnames(fairfield_lobster_methylation)) %>% 
+    subset(CHOSEN_LOCUS_SETS[[locus_set_name]], .)
+  
+  regression_objects <- run_regression_on_fairfield_data(
+    chosen_loci = chosen_loci_in_fairfield_data,
+    model_name = locus_set_name
+  )
+  
+  # Output
+  print(locus_set_name)
+  print(regression_objects$Regression$bestTune)
+  print(regression_objects$Metrics)
+  
+  regression_plot <- regression_objects$`Plot`
+  regression_nonzero_cpgs <- rownames(regression_objects$`Non-zero coefficients`)
+  
+  data_objects <- combine_datasets_at_chosen_loci(regression_nonzero_cpgs)
+  pca_objects <- run_comparative_pca(
+    combined_methylation_mvalues = data_objects$`Combined M-values`,
+    combined_lobster_samples_and_beta_values = data_objects$`Combined sample data`
+  )
+  pca_plot <- make_combined_pca_plot(
+    combined_pca_xlims = pca_objects$`Plot X-limits`,
+    combined_pca_importances = pca_objects$Importances,
+    comparison_pca_plot_data = pca_objects$`Plot data`,
+    number_of_loci_in_pca = length(regression_nonzero_cpgs)
+  )
+  
+  all_plots <- all_plots /
+    ((regression_plot | pca_plot) + patchwork::plot_layout(widths = c(3, 7)))
+}
+
+plot_comparison_pca <- all_plots +
+  plot_annotation(
+    tag_levels = list(
+      # Automatic tagging deals poorly with the insets, so define:
+      c("a", "", "b", "c", "", "d", "e", "", "f")
+    )
+  )
+```
+```{r plot_comparison_pca_plot, fig.height = 12.5, fig.width = 10, warning = FALSE, message = FALSE, echo = FALSE}
+plot_comparison_pca
+```
+
+
+END OF REPORT.
+
+```{r save_plots, include = FALSE}
+ggplot2::ggsave(
+  plot = plot_sequencing_coverage,
+  filename = "../output/figure_supplementary_sequencing_coverage.png",
+  width = 10,
+  height = 2,
+  dpi = 600
+)
+ggplot2::ggsave(
+  plot = plot_methylation_data,
+  filename = "../output/figure_methylation_data.png",
+  width = 10,
+  height = 4,
+  dpi = 600
+)
+ggplot2::ggsave(
+  plot = plot_differential_methylation,
+  filename = "../output/figure_differential_methylation.png",
+  width = 10,
+  height = 8.5,
+  dpi = 600
+)
+ggplot2::ggsave(
+  plot = plot_fairfield_ageing_accuracy,
+  filename = "../output/figure_fairfield_ageing_accuracy.png",
+  width = 10,
+  height = 7.5,
+  dpi = 600
+)
+ggplot2::ggsave(
+  plot = plot_ewas_combined,
+  filename = "../output/figure_ewas_analyses.png",
+  width = 10,
+  height = 7.5,
+  dpi = 600
+)
+ggplot2::ggsave(
+  plot = plot_model_comparison_figure,
+  filename = "../output/figure_model_comparison.png",
+  width = 10,
+  height = 7.5,
+  dpi = 600
+)
+ggplot2::ggsave(
+  plot = plot_comparison_pca,
+  filename = "../output/figure_comparison_pca.png",
+  width = 10,
+  height = 12.5,
+  dpi = 600
+)
+```

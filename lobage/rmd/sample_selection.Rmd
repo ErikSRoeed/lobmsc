@@ -1,0 +1,823 @@
+---
+title: "Like clockwork? A longitudinal test of an epigenetic clock in wild European losters (Homarus gammarus)"
+author: "Erik Sandertun Røed"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    code_folding: "show"
+    highlight: "breezedark"
+    theme: "spacelab"
+toc-title: "Code: sample selection"
+---
+
+## Dependencies
+```{r setup, warning = FALSE, message = FALSE}
+# For Rmd displays
+library(knitr)
+library(kableExtra)
+
+# For data wrangling and management
+library(dplyr)
+library(tidyr)
+library(magrittr)
+library(readr)
+library(readxl)
+
+# For plotting (not final figure)
+library(ggplot2)
+library(cowplot)
+library(patchwork)
+library(ggsignif)
+```
+
+## Data availability statement
+The datasets at `OBSERVATION_DATA_PATH` and `SAMPLES_DATA_PATH` are unpublished
+(as of writing), but available upon reasonable request to Louise Chavarie
+(louise.chavarie@nmbu.no).
+
+The `final_sample_selection.csv` file this document outputs is bundled in the 
+lobmsc repository alongside the document, plus a version with sample numbers for 
+sequencing appended.
+
+## Sample selection
+### Data import and pre-processing
+First, define the paths to our data sets of lobster observations (field records) and lobster samples (catalogue of tissue samples available). These data sets are identical or near identical to the original datasets of the monitoring program, but may for practical reasons have some inclusions or modifications that are specific to this sample selection pipeline. This includes samples added to the sample file that have not been properly catalogued yet, or recaptures that have not yet been entered into the regular dataset. Modifications specific to this project have a note prefixed with "ESRlobage".
+```{r data_paths}
+OBSERVATIONS_DATA_PATH <- "../data/20231217_lobage_field_observations.xlsx"
+SAMPLES_DATA_PATH <- "../data/20231217_lobage_samples_available.xlsx"
+```
+
+Then, import, format, and filter these data sets:
+```{r import_filter_data, echo = TRUE}
+observations_factors <- c("ZoneID", "Sex")
+observations_vars_drop_na <- c("SampleDate", "ZoneID", "ExistingTag", "LobsterID", "LengthCM", "Sex")
+observations_vars_keep_na <- c("ClippedNow", "CheckConfidence", "Eggs")
+observations_select_columns <- c(observations_vars_drop_na, observations_vars_keep_na)
+observation_is_reliable <- expr(CheckConfidence != "Uncertain" | is.na(CheckConfidence))
+
+samples_factors <- c("Species", "SampleConfidenceLevel")
+samples_other_vars <- c("SampleID", "Date")
+samples_select_columns <- c(samples_other_vars, samples_factors)
+
+all_tagged_lobster_observations <- read_xlsx(OBSERVATIONS_DATA_PATH, skip = 1) %>% 
+  mutate(SampleDate = as.Date.POSIXct(SampleDate)) %>% 
+  mutate(across(all_of(observations_factors), factor)) %>%
+  drop_na(all_of(observations_vars_drop_na)) %>%
+  select(all_of(observations_select_columns)) %>% 
+  filter(eval(observation_is_reliable)) %>%
+  filter(LobsterID != "Untagged") %>%
+  select(!CheckConfidence)
+
+all_lobster_samples <- read_xlsx(SAMPLES_DATA_PATH) %>% 
+  mutate(Date = as.Date.POSIXct(Date)) %>% 
+  mutate(across(all_of(samples_factors), factor)) %>% 
+  select(all_of(samples_select_columns)) %>% 
+  filter(Species == "Lobster") %>% 
+  select(!Species)
+```
+
+```{r show_tables1_2, class.source = "fold-hide"}
+all_tagged_lobster_observations %>%
+  head(n = 10) %>%
+  kbl(
+    align = "c",
+    caption = "TABLE 1: All lobsters (example): all_tagged_lobster_observations"
+  ) %>% 
+  kable_paper(fixed_thead = TRUE) %>% 
+  scroll_box(width = "100%")
+
+all_lobster_samples %>% 
+  head(n = 10) %>% 
+  kbl(
+    align = "c",
+    caption = "TABLE 2: Available lobster samples (example): all_lobster_samples. Note that NAs in Date and SampleConfidenceLevel are expected for a number of tissue samples that were not catalogued or quality checked for this study."
+  ) %>% 
+  kable_paper(fixed_thead = TRUE) %>% 
+  scroll_box(width = "100%")
+```
+
+
+### Capture interval analysis
+#### Find recaptured lobsters
+Proceed searching for qualified re-captured lobsters, i.e. those that meet the following criteria:
+```{r sample_pool_filter_definitions}
+# Criteria for observations data set
+QUALIFY_RECAPTURES_AFTER_DATE <- as.Date.character("2022-01-01")
+QUALIFIED_GROWTH_ERROR_MAX_CM <- 0.5
+QUALIFIED_MINIMUM_INTERVAL_MONTHS <- 11
+
+# How to bin re-captures above qualified minimum interval
+BINS_UPPER_BREAKS_MONTHS <- c(
+  13, # 12 months + 1 (max hypothetical "error" if samples taken e.g. 01-09-2020 and 30-09-2021)
+  16, # 15 months + 1
+  22, # 21 months + 1
+  25, # etc...
+  28,
+  34,
+  37,
+  40
+)
+
+# Criteria for samples data set
+QUALIFIED_SAMPLE_CONFIDENCE <- c("Checked", "Inferred")
+```
+
+Applying `QUALIFY_RECAPTURES_AFTER_DATE`, proceed with only lobsters recaptured at least once after the specified date (on the assumption that re-captures before that were not tissue sampled and so are not necessary to include):
+```{r unique_recaptures}
+unique_recaptured_lobster_tags <- all_tagged_lobster_observations %>%
+  filter(SampleDate > QUALIFY_RECAPTURES_AFTER_DATE) %>%
+  filter(ExistingTag) %>%
+  select(LobsterID) %>% 
+  unlist() %>% 
+  unique()
+
+count_of_unique_recaptures <- length(unique_recaptured_lobster_tags)
+```
+
+#### Capture interval table
+Now, create a capture interval table of qualified lobsters, with flags for manual check-up of inconsistent recapture records, inconsistent zone of capture, inconsistent sex, negative growth, or missing/unchecked/uncertain sample status:
+```{r capture_interval_table}
+# Table has as many rows as there are recapture lobsters
+table_nrows <- count_of_unique_recaptures
+
+# Table has same categorical factors as original data set
+capture_interval_table <- data.frame(
+  "LobsterID" = unique_recaptured_lobster_tags,
+  "ZoneID" = factor(
+    table_nrows,
+    levels = levels(all_tagged_lobster_observations$ZoneID)
+  ),
+  "Sex" = factor(
+    table_nrows, 
+    levels = levels(all_tagged_lobster_observations$Sex)
+  ),
+  "CaptureDate" = as.Date(double(table_nrows)),
+  "RecaptureDate" = as.Date(double(table_nrows)),
+  "CaptureIntervalDays" = double(table_nrows),
+  "CaptureEggs" = logical(table_nrows),
+  "RecaptureEggs" = logical(table_nrows),
+  "CaptureLengthCM" = double(table_nrows),
+  "RecaptureLengthCM" = double(table_nrows),
+  "GrowthCM" = double(table_nrows),
+  "Flags" = character(table_nrows)
+)
+
+for (lobster_tag in capture_interval_table$LobsterID)
+{
+  # Row index of lobster in capture interval table
+  lobster_row_index <- which(capture_interval_table$LobsterID == lobster_tag)
+  
+  # Get relevant observations and samples
+  observations_of_this_lobster <- all_tagged_lobster_observations %>% 
+    filter(LobsterID == lobster_tag)
+  
+  samples_from_this_lobster <- all_lobster_samples %>% 
+    filter(SampleID == lobster_tag)
+  
+  first_clipped_observation <- observations_of_this_lobster %>% 
+    filter(ClippedNow != FALSE | is.na(ClippedNow)) %>% # Clipped observation may be NA, but not FALSE
+    slice(which.min(SampleDate))
+  
+  last_clipped_observation <- observations_of_this_lobster %>% 
+    filter(ExistingTag == TRUE) %>% 
+    filter(ClippedNow == TRUE) %>% 
+    slice(which.max(SampleDate))
+  
+  # Skip lobsters not clipped at recapture, remove from table
+  lobster_not_clipped_at_recapture <- nrow(last_clipped_observation) == 0
+  if (lobster_not_clipped_at_recapture)
+  {
+    capture_interval_table %<>% filter(LobsterID != lobster_tag)
+    next
+  }
+  
+  # Fill in table
+  capture_date <- first_clipped_observation$SampleDate
+  recapture_date <- last_clipped_observation$SampleDate
+  capture_interval_days <- as.numeric(recapture_date - capture_date)
+  capture_eggs <- first_clipped_observation$Eggs
+  recapture_eggs <- last_clipped_observation$Eggs
+  capture_length_cm <- first_clipped_observation$LengthCM
+  recapture_length_cm <- last_clipped_observation$LengthCM
+  growth_cm <- round(recapture_length_cm - capture_length_cm, digits = 2)
+  
+  capture_interval_table[lobster_row_index, ] %<>% 
+    mutate(CaptureDate = capture_date) %>% 
+    mutate(RecaptureDate = recapture_date) %>% 
+    mutate(CaptureIntervalDays = capture_interval_days) %>% 
+    mutate(CaptureEggs = capture_eggs) %>% 
+    mutate(RecaptureEggs = recapture_eggs) %>% 
+    mutate(CaptureLengthCM = capture_length_cm) %>% 
+    mutate(RecaptureLengthCM = recapture_length_cm) %>% 
+    mutate(GrowthCM = growth_cm) %>% 
+    mutate(ZoneID = first_clipped_observation$ZoneID) %>% 
+    mutate(Sex = first_clipped_observation$Sex)
+  
+  # Flag lobsters satisfying the following conditions for manual check
+  zone_is_inconsistent <- length(unique(observations_of_this_lobster$ZoneID)) != 1
+  sex_is_inconsistent <- length(unique(observations_of_this_lobster$Sex)) != 1
+  growth_is_negative <- growth_cm < -QUALIFIED_GROWTH_ERROR_MAX_CM
+  
+  recaptures_are_inconsistent <- observations_of_this_lobster %>% 
+    # For first capture date, invert recapture status (e.g. from FALSE to TRUE)
+    mutate(ExistingTag = ifelse(SampleDate == min(SampleDate), !ExistingTag, ExistingTag)) %>% 
+    select(ExistingTag) %>% 
+    # If any observations are FALSE, it is TRUE that recapture record is inconsistent
+    all() %>% !.
+  
+  # Also flag lobsters where sample confidence or availability must be checked
+  sample_confidence_levels <- samples_from_this_lobster %>% 
+    filter(Date %in% c(capture_date, recapture_date)) %>% 
+    select(SampleConfidenceLevel) %>% 
+    unlist()
+  
+  sample_dates <- samples_from_this_lobster %>% 
+    select(Date) %>%
+    unlist() %>% 
+    as.Date()
+  
+  must_check_samples <- FALSE
+  
+  if (! capture_date %in% sample_dates | ! recapture_date %in% sample_dates)
+  {
+    must_check_samples <- TRUE
+  }
+  
+  if (! all(sample_confidence_levels %in% QUALIFIED_SAMPLE_CONFIDENCE))
+  {
+    must_check_samples <- TRUE
+  }
+  
+  # Functionalise flag-adding
+  add_flag_if <- function(current_flags, flag_message, condition)
+  {
+    EMPTY_FLAGS <- ""
+    
+    if (! condition)
+    {
+      return(current_flags)
+    }
+    
+    if (current_flags == EMPTY_FLAGS)
+    {
+      return(flag_message)
+    }
+    
+    combined_flag_message <- paste(c(current_flags, flag_message), collapse = ", ")
+    return(combined_flag_message)
+  }
+  
+  # Add flags
+  capture_interval_table$Flags[lobster_row_index] %<>%
+    add_flag_if("Recapture", recaptures_are_inconsistent) %>% 
+    add_flag_if("Samples", must_check_samples) %>% 
+    add_flag_if("Growth", growth_is_negative) %>% 
+    add_flag_if("Zone", zone_is_inconsistent) %>% 
+    add_flag_if("Sex", sex_is_inconsistent)
+}
+```
+
+In this table, also bin the lobsters by their capture interval to monthly resolution:
+```{r bins}
+DAYS_IN_MONTH <- 30.5
+bins_labels <- paste(BINS_UPPER_BREAKS_MONTHS - 1, "mo.")
+
+# Bin capture intervals into year-groups
+capture_interval_table %<>% 
+  mutate(
+    CaptureIntervalBins = cut(
+      x = CaptureIntervalDays,
+      breaks = DAYS_IN_MONTH * c(
+        QUALIFIED_MINIMUM_INTERVAL_MONTHS,
+        BINS_UPPER_BREAKS_MONTHS
+      ),
+      labels = bins_labels,
+      include.lowest = TRUE
+    )
+  )
+```
+
+Filter the table to separate it into qualified samples and samples that require manual validation before they can be considered qualified. Samples and re-capture records have been controlled manually for all lobsters, by checking that no conflicting information exists in the observations and samples data set. Where there are possible conflicts (e.g. multiple samples that share a label so we cannot tell which is the true sample, or a re-capture record that confounds identification of an undated sample) the otherwise qualified lobster remains flagged and excluded from the filtered capture interval table.
+```{r export_capture_interval_table}
+# Filter out entries with flags or same calendar year recaptures
+NO_FLAGS <- ""
+
+filtered_capture_interval_table <- capture_interval_table %>%
+  filter(CaptureIntervalDays >= QUALIFIED_MINIMUM_INTERVAL_MONTHS * DAYS_IN_MONTH) %>%
+  filter(Flags == NO_FLAGS) %>% 
+  select(!Flags)
+
+flagged_capture_interval_table <- capture_interval_table %>% 
+  filter(CaptureIntervalDays >= QUALIFIED_MINIMUM_INTERVAL_MONTHS * DAYS_IN_MONTH) %>%
+  filter(Flags != NO_FLAGS)
+```
+
+```{r show_sample_pool, class.source = "fold-hide"}
+sample_pool_size <- nrow(filtered_capture_interval_table)
+flagged_pool_size <- nrow(flagged_capture_interval_table)
+
+filtered_capture_interval_table %>% 
+  arrange(-CaptureIntervalDays) %>% 
+  kbl(
+    align = "c",
+    caption = paste(sep = "",
+    "TABLE 3: Qualified age estimation validation sample pool (N = ",
+    sample_pool_size,
+    ") in order of decreasing capture interval. ",
+    "Includes samples that were previously in Table 4, but that were resolved."
+    )
+  ) %>% 
+  kable_paper(fixed_thead = TRUE) %>% 
+  scroll_box(width = "100%", height = "600px")
+
+flagged_capture_interval_table %>% 
+  arrange(-CaptureIntervalDays) %>% 
+  kbl(
+    align = "c",
+    caption = paste(sep = "",
+    "TABLE 4: Otherwise qualified samples flagged for manual check-up (N = ",
+    flagged_pool_size,
+    ") in order of decreasing capture interval. ",
+    "As of 12.12.2023 these have been controlled manually, but issues cannot been resolved. ",
+    "'Recapture' indicates an unlikely recapture record. ",
+    "'Sex' indicates inconsistently recorded sex. ",
+    "'Zone' indicates re-capture in different zones. ",
+    "'Growth' indicates negative growth in excess of the allowed error.",
+    "'Samples' indicates missing or unusable samples."
+    )
+  ) %>% 
+  kable_paper(fixed_thead = TRUE) %>% 
+  scroll_box(width = "100%", height = "600px")
+```
+
+### Sample selection
+#### Plotting a data summary
+To summarise the data in the capture interval table(s), define the `plot_capture_interval_summary` function and necessary prerequesites (code hidden for brevity, expand for details):
+```{r define_summary_drawing_function, class.source = "fold-hide"}
+get_used_factor_levels <- function(table_column)
+{
+  levels_in_data <- table_column %>% 
+    droplevels() %>% 
+    levels() %>% 
+    return()
+}
+
+get_factor_level_colors <- function(level_names, colorbrewer_palette_name)
+{
+  factor_level_colors <- RColorBrewer::brewer.pal(
+    name = colorbrewer_palette_name,
+    n = length(level_names)
+  )[1 : length(level_names)]
+  
+  return(factor_level_colors)
+}
+
+draw_sex_ratio_plot <- function(capture_interval_table, colours, text_colour)
+{
+  capture_interval_table %>% 
+    group_by(Sex) %>% 
+    summarise(SexCounts = n()) %>% 
+    arrange(Sex) %>% 
+    ggplot(aes(x = "", y = SexCounts, fill = Sex)) +
+    scale_fill_manual(values = colours) +
+    geom_col(col = "black") +
+    coord_polar("y") +
+    guides(fill = FALSE) +
+    labs(x = "Sample-wide sex ratio", y = NULL, fill = NULL) +
+    geom_text(
+      aes(label = paste(c("Female", "Male"), "\n(", SexCounts, ")", sep = "")),
+      position = position_stack(vjust = 0.5),
+      col = text_colour,
+      size = 3.5
+    ) +
+    background_grid(major = "none", minor = "none") +
+    theme(
+      axis.line = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.background = element_blank()
+    ) %>% 
+    return()
+}
+
+draw_capture_interval_plot <- function(capture_interval_table, colours, text_colour)
+{
+  MINIMUM_BAR_HEIGHT_FOR_INTERNAL_LABEL <- 3
+  
+  capture_interval_table %>% 
+    ggplot(aes(x = CaptureIntervalBins)) +
+    geom_bar(fill = colours, col = "black") +
+    geom_text(
+      aes(
+        label = ..count..,
+        y = ifelse(
+          ..count.. >= MINIMUM_BAR_HEIGHT_FOR_INTERNAL_LABEL,
+          ..count.. - 1.5,
+          ..count.. + 1.5
+        )
+      ),
+      stat = "count",
+      col = text_colour
+    ) +
+    ylab("Lobsters") +
+    theme_minimal() +
+    background_grid(major = "none", minor = "none") +
+    theme(
+      axis.text.y = element_blank(),
+      axis.line = element_blank(),
+      panel.background = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank(),
+      plot.margin = unit(c(0, 0, -10, 0), "lines"),
+    ) %>% 
+    return()
+}
+
+draw_per_interval_sex_ratio_plots <- function(capture_interval_table, colours)
+{
+  capture_interval_table %>% 
+    group_by(CaptureIntervalBins, Sex) %>% 
+    summarise(SexCounts = n()) %>% 
+    mutate(SexPercentage = SexCounts / sum(SexCounts)) %>% 
+    arrange(Sex) %>% 
+    ggplot(aes(x = "", y = SexPercentage, fill = Sex)) +
+    geom_col(col = "black") +
+    xlab("Sex ratio") +
+    ylab("Recapture interval") +
+    scale_fill_manual(values = colours) +
+    coord_polar("y", ) +
+    facet_grid(.~CaptureIntervalBins, switch = "x") +
+    guides(fill = FALSE) +
+    theme_minimal() +
+    background_grid(major = "none", minor = "none") +
+    theme(
+      axis.text.y = element_blank(),
+      axis.line = element_blank(),
+      panel.background = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.y = element_text(vjust = 2),
+      plot.margin = unit(c(-50, 0, 0, 0), "lines"),
+      panel.spacing.x = unit(0, "lines")
+    ) %>% 
+    return()
+}
+
+draw_body_length_plot <- function(capture_interval_table, colours)
+{
+  y_limits <- c(
+    min(capture_interval_table$CaptureLengthCM) - 2,
+    max(capture_interval_table$RecaptureLengthCM) + 4
+  )
+  
+  plottable_data_table <- capture_interval_table %>%
+    select(LobsterID, CaptureLengthCM, RecaptureLengthCM, CaptureIntervalBins) %>% 
+    pivot_longer(
+      cols = !c(LobsterID, CaptureIntervalBins),
+      names_to = "Measurement",
+      values_to = "ValueCM"
+    ) %>% 
+    mutate(CaptureIntervalBinsChar = as.character(CaptureIntervalBins)) %>% 
+    mutate(MeasurementChar = as.character(Measurement)) %>% 
+    unite(col = "FillFactor", MeasurementChar, CaptureIntervalBinsChar) %>% 
+    mutate(
+      FillFactor = ifelse(
+        grepl(x = FillFactor, pattern = "Capture"),
+        "Capture",
+        FillFactor
+      )
+    ) %>% 
+    mutate(FillFactor = as.factor(FillFactor)) %>% 
+    select(LobsterID, CaptureIntervalBins, Measurement, ValueCM, FillFactor)
+  
+  body_length_plot <- plottable_data_table %>% 
+    ggplot(aes(y = ValueCM, x = Measurement)) +
+    facet_grid(.~CaptureIntervalBins, switch = "x") +
+    geom_boxplot(
+      aes(fill = FillFactor),
+      position = position_nudge(x = c(-0.2, 0.2)),
+      width = 0.1,
+      key_glyph = "blank"
+    ) +
+    geom_line(
+      aes(group = LobsterID),
+      col = "gray25",
+      lwd = 0.5
+    ) +
+    geom_point(
+      aes(fill = FillFactor),
+      col = "black",
+      pch = 21,
+      size = 3.5,
+      alpha = 0.5
+    ) +
+    geom_signif(
+      test = "t.test",
+      test.args = list("paired" = TRUE),
+      map_signif_level = FALSE,
+      comparisons = list(
+        c(
+          "CaptureLengthCM",
+          "RecaptureLengthCM"
+        )
+      )
+    ) +
+    scale_y_continuous(limits = y_limits) +
+    scale_fill_manual(
+      values = c("gray90", colours),
+      label = c(") and recapture (", rep(",", length(colours) - 1), ")")
+    ) +
+    guides(
+      fill = guide_legend(
+        title = "Total length at capture (",
+        direction = "horizontal",
+        label.position = "right",
+        ncol = length(colours) + 1
+        )
+      ) +
+    xlab("Recapture interval") +
+    ylab("Total length (cm)") +
+    theme_classic() +
+    theme(
+      axis.line.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.y = element_text(vjust = 5),
+      axis.ticks.x = element_blank(),
+      strip.background = element_blank(),
+      panel.spacing = unit(0, "lines"),
+      legend.text = element_text(size = 11),
+      legend.title = element_text(size = 11),
+      legend.position = "top",
+      legend.margin = margin(b = -35),
+      legend.spacing.x = unit(0, "lines")
+    )
+  
+  return(body_length_plot)
+}
+
+plot_capture_interval_summary <- function(capture_interval_table)
+{
+  SEX_PLOT_COLOURS <- get_factor_level_colors(
+    level_names = get_used_factor_levels(capture_interval_table$Sex),
+    colorbrewer_palette_name = "Set2"
+  )
+  
+  INTERVAL_COLOURS <- get_factor_level_colors(
+    level_names = get_used_factor_levels(capture_interval_table$CaptureIntervalBins),
+    colorbrewer_palette_name = "Blues"
+  )
+  
+  TEXT_COLOUR <- "gray10"
+  
+  # Draw plots
+  ((draw_sex_ratio_plot(capture_interval_table, SEX_PLOT_COLOURS, TEXT_COLOUR) / 
+      (draw_capture_interval_plot(capture_interval_table, INTERVAL_COLOURS, TEXT_COLOUR) /
+         (draw_per_interval_sex_ratio_plots(capture_interval_table, SEX_PLOT_COLOURS) +
+            plot_layout(tag_level = "new")) +
+         plot_layout(nrow = 2, heights = c(3, 1)))) |
+      draw_body_length_plot(capture_interval_table, INTERVAL_COLOURS)) +
+    plot_layout(ncol = 2, widths = c(1, 3)) +
+    plot_annotation(tag_levels = "a") %>% 
+    return()
+}
+```
+
+Then, draw a summary of all the qualified lobsters before selecting a final sample:
+```{r draw_qualified_summary, summary_1, message= FALSE, warning = FALSE, fig.height=6, fig.width=12, class.source = "fold-hide"}
+filtered_capture_interval_table %>% plot_capture_interval_summary()
+```
+
+#### Selecting final lobsters
+For our final sample, first take all lobsters of intervals 15 mo. or above:
+```{r final_selection_1}
+# We take all lobsters of intervals 15 mo. or above:
+final_capture_interval_table <- filtered_capture_interval_table %>% 
+  filter(CaptureIntervalBins != "12 mo.")
+```
+
+The 15 mo. interval and above lobsters amount to N = 41, so we must complement this with N = 7 lobsters from the 12 mo. interval group. Select them, and bind them to the `final_capture_interval_table`. The sample without them is well balanced for the amount of males vs. females, so we aim to get some more low total body length individuals, that are mostly available in the 12 mo. interval group. We take the seven lobsters from the 12. mo interval group with the smallest capture length:
+```{r final_selection_2}
+TOTAL_SAMPLE_SIZE <- 48
+EXTRA_LOBSTERS_REQUIRED <- TOTAL_SAMPLE_SIZE - nrow(final_capture_interval_table)
+
+extra_lobsters_table <- filtered_capture_interval_table %>% 
+  filter(CaptureIntervalBins == "12 mo.") %>% 
+  arrange(CaptureLengthCM) %>% 
+  slice_head(n = EXTRA_LOBSTERS_REQUIRED) %>% 
+  arrange(-CaptureIntervalDays)
+
+final_capture_interval_table %<>% bind_rows(extra_lobsters_table)
+```
+
+Then draw a new summary and table, with just the final sample selection of N = 48. This is also exported to a .csv file to work with later. Now we have a final sample for DNA extractions and downstream analysis.
+```{r final_output, message= FALSE, warning = FALSE, fig.height=6, fig.width=12, class.source = "fold-hide"}
+final_capture_interval_table %>% plot_capture_interval_summary()
+
+final_capture_interval_table %>% 
+  arrange(-CaptureIntervalDays) %T>% 
+  write_excel_csv2(file = "../output/final_sample_selection.csv") %>% # Also export
+  kbl(
+    align = "c",
+    caption = paste(sep = "",
+    "TABLE 5: Final selection of samples for age estimation validation (N = ",
+    nrow(.),
+    ") in order of decreasing capture interval. "
+    )
+  ) %>% 
+  kable_paper(fixed_thead = TRUE) %>% 
+  scroll_box(width = "100%", height = "600px")
+```
+
+## Final sample selection figure for Article A (Thesis)
+### Plotting dependencies
+These are the dependencies cited in the thesis, as this is the final figure.
+```{r final_plot_dependencies}
+# Handling data
+library(tidyr)
+library(dplyr)
+library(magrittr)
+
+# Actual plotting
+library(ggplot2)
+library(patchwork)
+library(RColorBrewer)
+```
+
+### Theme definitions
+```{r final_plot_theme_definitions}
+POINT_SIZE <- 3.5
+CAP_COLOUR <- RColorBrewer::brewer.pal(n = 6, "Dark2")[5]
+RECAP_COLOUR <- RColorBrewer::brewer.pal(n = 6, "Dark2")[6]
+FEMALE_COLOUR <- RColorBrewer::brewer.pal(n = 3, "Set2")[2]
+MALE_COLOUR <- RColorBrewer::brewer.pal(n = 3, "Set2")[3]
+BAR_COLOUR <- RColorBrewer::brewer.pal(n = 8, "Dark2")[8]
+LINE_COLOUR <- "black"
+LINE_ALPHA <- 0.05
+```
+
+### Figure
+```{r final_sample_figure, message = FALSE}
+sex_ratio_panel <- final_capture_interval_table %>% 
+  dplyr::group_by(Sex) %>% 
+  dplyr::summarise(SexCounts = n()) %>% 
+  dplyr::mutate(Sex = ifelse(Sex == "F", "\u2640", "\u2642")) %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(y = "", x = SexCounts, fill = Sex)
+  ) +
+  ggplot2::coord_polar(theta = "x") +
+  ggplot2::geom_col(col = "black", lwd = 0.25, show.legend = FALSE) +
+  ggplot2::geom_text(
+    ggplot2::aes(label = paste(Sex, "\n(", SexCounts, ")", sep = "")),
+    position = ggplot2::position_stack(vjust = 0.5)
+  ) +
+  ggplot2::scale_fill_manual(values = c(MALE_COLOUR, FEMALE_COLOUR)) +
+  ggplot2::xlab("Sex ratio") +
+  ggplot2::theme(
+    axis.text = ggplot2::element_blank(),
+    axis.ticks = ggplot2::element_blank(),
+    axis.title.y = ggplot2::element_blank(),
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "black"),
+  )
+
+capture_interval_panel <- final_capture_interval_table %>% 
+  dplyr::mutate(
+    CaptureIntervalBins = factor(
+      CaptureIntervalBins,
+      levels = c(
+        "12 mo.",
+        "15 mo.",
+        "21 mo.",
+        "24 mo.",
+        "27 mo.",
+        "36 mo."
+      )
+    )
+  ) %>% 
+  ggplot2::ggplot(aes(x = CaptureIntervalBins, fill = Sex)) +
+  ggplot2::geom_bar(col = "black", lwd = 0.25, width = 0.75) +
+  ggplot2::scale_fill_manual(
+    values = c(MALE_COLOUR, FEMALE_COLOUR),
+    labels = c("\u2640", "\u2642")
+  ) +
+  ggplot2::ylab("Count") +
+  ggplot2::xlab("Capture interval (binned)") +
+  ggplot2::theme(
+    legend.background = ggplot2::element_rect(
+      fill = "white",
+      colour = "black",
+      linewidth = 0.25
+    ),
+    legend.text = element_text(size = 11),
+    legend.title = element_blank(),
+    legend.position = "inside",
+    legend.position.inside = c(0.925, 0.8),
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "black")
+  )
+
+size_growth_panel <- final_capture_interval_table %>% 
+  tidyr::pivot_longer(
+    cols = c(CaptureLengthCM, RecaptureLengthCM),
+    names_to = "Encounter",
+    values_to = "LengthCM"
+  ) %>% 
+  ggplot2::ggplot(
+    ggplot2::aes(
+      y = LengthCM,
+      x = Encounter,
+      fill = Encounter
+    )
+  ) +
+  ggplot2::geom_line(
+    ggplot2::aes(group = LobsterID),
+    colour = LINE_COLOUR,
+    alpha = 0.15,
+    position = ggplot2::position_nudge(x = c(0.25, -0.25))
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(shape = Sex),
+    position = ggplot2::position_nudge(x = c(0.25, -0.25)),
+    col = "black",
+    size = POINT_SIZE
+  ) +
+  ggplot2::geom_boxplot(
+    fill = "white",
+    width = 0.2,
+    position = ggplot2::position_nudge(x = c(-0.1, 0.1))
+  ) +
+  ggplot2::guides(
+    fill = ggplot2::guide_legend(
+      order = 1,
+      title = NULL,
+      override.aes = list(shape = 21, fill = c(CAP_COLOUR, RECAP_COLOUR))
+    ),
+    shape = ggplot2::guide_legend(
+      order = 2,
+      title = NULL,
+      override.aes = list(fill = "black")
+    )
+  ) +
+  ggplot2::facet_grid(
+    cols = ggplot2::vars(CaptureIntervalBins),
+    scales = "fixed"
+  ) +
+  ggplot2::scale_fill_manual(
+    values = c(CAP_COLOUR, RECAP_COLOUR),
+    labels = c("Capture", "Recapture")
+  ) +
+  ggplot2::scale_shape_manual(
+    values = c(21, 22),
+    labels = c("\u2640", "\u2642")
+  ) +
+  ggplot2::scale_y_continuous(
+    name = "Total length (cm)",
+    sec.axis = ggplot2::dup_axis()
+  ) +
+  ggplot2::xlab("Capture interval (binned)") +
+  ggplot2::theme(
+    axis.line = ggplot2::element_line(colour = "black", linewidth = 0.25),
+    axis.text.x = ggplot2::element_blank(),
+    axis.ticks.x = ggplot2::element_blank(),
+    axis.text.y.right = ggplot2::element_blank(),
+    axis.ticks.y.right = ggplot2::element_blank(),
+    axis.title.y.right = ggplot2::element_blank(),
+    legend.background = ggplot2::element_rect(
+      fill = "white",
+      colour = "black",
+      linewidth = 0.25
+    ),
+    legend.box.just = "right",
+    legend.direction = "vertical",
+    legend.justification.inside = c(0.985, 0.95),
+    legend.key = ggplot2::element_blank(),
+    legend.text = element_text(size = 11),
+    legend.position = "inside",
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_rect(fill = NA, colour = "#dbdbdb"),
+    panel.spacing = ggplot2::unit(0, "lines"),
+    strip.background = ggplot2::element_rect(fill = "#ebebeb", colour = "black")
+  )
+
+sample_selection_figure <- (
+  (sex_ratio_panel | capture_interval_panel) +
+    patchwork::plot_layout(widths = c(3, 7))) /
+  size_growth_panel +
+  patchwork::plot_layout(heights = c(3, 4.5)) +
+  patchwork::plot_annotation(tag_levels = "a")
+```
+```{r display_final_sample_figure, fig.width = 10, fig.height = 7.5, echo = FALSE}
+sample_selection_figure
+```
+```{r save_final_figure, echo = FALSE, include = FALSE}
+ggplot2::ggsave(
+  plot = sample_selection_figure,
+  filename = "../output/sample_selection.png",
+  width = 10,
+  height = 7.5,
+  dpi = 600
+)
+```
+
+END OF REPORT.
